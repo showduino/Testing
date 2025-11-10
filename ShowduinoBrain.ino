@@ -138,6 +138,24 @@ static Adafruit_NeoPixel pixels(LED_PIXEL_COUNT, LED_PIXEL_PIN, NEO_GRB + NEO_KH
 static uint8_t uiPeer[6] = {0};
 static bool peerKnown = false;
 
+static bool brainI2cPresent[128] = {false};
+
+struct BrainAddonDef {
+  uint8_t addonId;
+  bool requiresI2C;
+  uint8_t i2cAddr;
+};
+
+static const BrainAddonDef brainAddonDefs[] = {
+  {10, false, 0x00}, // Smoke relay (direct drive)
+  {11, false, 0x00}, // NeoPixel (GPIO driven)
+  {12, true,  0x3E}, // Relay expander (e.g., SX1509)
+  {13, false, 0x00}, // MP3 players (UART/I2C handled elsewhere)
+  {14, true,  0x41}  // R3 Terminal (hypothetical I2C FX board)
+};
+static constexpr size_t brainAddonCount = sizeof(brainAddonDefs) / sizeof(BrainAddonDef);
+static bool brainAddonAvailable[brainAddonCount] = {false};
+
 // ────────────────────────────────────────────────
 //  Helper Functions
 // ────────────────────────────────────────────────
@@ -156,6 +174,59 @@ void setFanDuty(float temperatureC) {
   }
   uint32_t pwmValue = duty * ((1 << FAN_PWM_RESOLUTION) - 1);
   ledcWrite(FAN_PWM_CHANNEL, pwmValue);
+}
+
+const BrainAddonDef* findBrainAddon(uint8_t addonId, size_t *indexOut = nullptr) {
+  for (size_t i = 0; i < brainAddonCount; ++i) {
+    if (brainAddonDefs[i].addonId == addonId) {
+      if (indexOut) *indexOut = i;
+      return &brainAddonDefs[i];
+    }
+  }
+  return nullptr;
+}
+
+bool brainAddonIsAvailable(uint8_t addonId) {
+  size_t idx = 0;
+  const BrainAddonDef *def = findBrainAddon(addonId, &idx);
+  if (!def) {
+    // Unknown add-on: treat as optional (ignore commands gracefully).
+    return false;
+  }
+  if (!def->requiresI2C) {
+    return true;
+  }
+  return brainAddonAvailable[idx];
+}
+
+void scanI2CDevices() {
+  memset(brainI2cPresent, 0, sizeof(brainI2cPresent));
+  Serial.println("[I2C] Scanning bus...");
+  for (uint8_t addr = 1; addr < 0x7F; ++addr) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      brainI2cPresent[addr] = true;
+      Serial.printf("[I2C] ✓ 0x%02X detected\n", addr);
+    }
+    yield();
+  }
+}
+
+void updateBrainAddonAvailability() {
+  for (size_t i = 0; i < brainAddonCount; ++i) {
+    const BrainAddonDef &def = brainAddonDefs[i];
+    if (!def.requiresI2C) {
+      brainAddonAvailable[i] = true;
+    } else {
+      uint8_t addr = def.i2cAddr & 0x7F;
+      brainAddonAvailable[i] = brainI2cPresent[addr];
+    }
+    Serial.printf("[ADDON] %u -> %s\n",
+                  def.addonId,
+                  brainAddonAvailable[i] ? "available" : "missing");
+    yield();
+  }
 }
 
 void handleSmokeAction(uint8_t action, uint16_t param) {
@@ -235,6 +306,10 @@ void handleR3AddonAction(uint16_t preset) {
 void handleAddonCommand(uint8_t addonId, uint32_t packedAction, uint16_t value) {
   uint8_t action = (packedAction >> 16) & 0xFF;
   uint16_t aux = packedAction & 0xFFFF;
+  if (!brainAddonIsAvailable(addonId)) {
+    Serial.printf("[ADDON] Ignored command for add-on %u (not available)\n", addonId);
+    return;
+  }
   switch (addonId) {
     case 10: handleSmokeAction(action, value); break;
     case 11: handlePixelAction(action, value); break;
@@ -406,8 +481,8 @@ void setup() {
   initRTC();
   initESPNow();
 
-  scan_i2c_bus();
-  update_addon_availability();
+  scanI2CDevices();
+  updateBrainAddonAvailability();
 
   Serial.println("[BOOT] Brain ready.");
 }
