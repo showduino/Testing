@@ -123,12 +123,28 @@ enum CommandType : uint8_t {
   CMD_TIMELINE_LOOP = 15,
   CMD_SYNC_SD = 16,
   CMD_MP3_SCAN = 17,
-  CMD_REQUEST_FILE_LIST = 18
+  CMD_REQUEST_FILE_LIST = 18,
+  CMD_ADDON_ACTION = 19
 };
 
 enum ControlMode : uint8_t {
   MODE_AUTO = 0,
   MODE_MANUAL = 1
+};
+
+enum AddonAction : uint8_t {
+  ADDON_SMOKE_TRIGGER = 1,
+  ADDON_SMOKE_INTENSITY = 2,
+  ADDON_SMOKE_PURGE = 3,
+  ADDON_PIXELS_BRIGHTNESS = 10,
+  ADDON_PIXELS_EFFECT = 11,
+  ADDON_RELAY_TOGGLE_BASE = 20,
+  ADDON_MP3_PLAY = 30,
+  ADDON_MP3_STOP = 31,
+  ADDON_MP3_VOLUME_A = 32,
+  ADDON_MP3_VOLUME_B = 33,
+  ADDON_MP3_SYNC = 34,
+  ADDON_R3_PRESET = 40
 };
 
 struct ShowduinoCommand {
@@ -171,6 +187,7 @@ static lv_obj_t *screen_settings = nullptr;
 static lv_obj_t *screen_diagnostics = nullptr;
 static lv_obj_t *screen_builder = nullptr;
 static lv_obj_t *screen_files = nullptr;
+static lv_obj_t *screen_addons = nullptr;
 static lv_obj_t *crosshair = nullptr;
 
 // Live Control UI elements
@@ -264,6 +281,46 @@ struct FileEntry {
 static FileEntry fileEntries[128];
 static size_t fileEntryCount = 0;
 
+struct AddonCardContext;
+
+typedef void (*AddonBuildFn)(AddonCardContext *ctx);
+typedef void (*AddonRefreshFn)(AddonCardContext *ctx, const ShowduinoStatus &status);
+
+struct AddonDefinition {
+  const char *name;
+  const char *category;
+  uint8_t id;
+  AddonBuildFn buildFn;
+  AddonRefreshFn refreshFn;
+};
+
+struct AddonControlRefs {
+  lv_obj_t *sliderPrimary = nullptr;
+  lv_obj_t *sliderSecondary = nullptr;
+  lv_obj_t *dropdown = nullptr;
+  lv_obj_t *toggleButtons[16] = {nullptr};
+  lv_obj_t *statusLabel = nullptr;
+};
+
+struct AddonCardContext {
+  const AddonDefinition *def = nullptr;
+  uint8_t addonId = 0;
+  lv_obj_t *card = nullptr;
+  AddonControlRefs controls;
+  bool updating = false;
+};
+
+struct AddonEventPayload {
+  AddonCardContext *ctx;
+  uint8_t action;
+  uint16_t aux;
+};
+
+static constexpr size_t MAX_ADDONS = 8;
+static AddonCardContext addonCardContexts[MAX_ADDONS];
+static size_t addonCardCount = 0;
+static bool updatingAddonUi = false;
+
 // User-data backing arrays (stable memory for LVGL callbacks)
 static uint8_t relayIdMap[8] = {0, 1, 2, 3, 4, 5, 6, 7};
 static uint8_t mp3DeckMap[2] = {0, 1};
@@ -347,10 +404,13 @@ void create_live_control_screen();
 void create_settings_screen();
 void create_diagnostics_screen();
 void create_builder_screen();
+void create_addons_screen();
+void create_file_browser_screen();
 void update_live_controls(const ShowduinoStatus &status);
 void update_link_indicator();
 void update_settings_telemetry();
 void update_diagnostics_panel(const ShowduinoStatus &status);
+void update_addon_cards(const ShowduinoStatus &status);
 void refresh_show_library();
 void builder_show_item_event_cb(lv_event_t *e);
 void builder_clip_event_cb(lv_event_t *e);
@@ -371,7 +431,6 @@ void settings_timeline_control_event_cb(lv_event_t *e);
 void settings_loop_toggle_event_cb(lv_event_t *e);
 void settings_sync_event_cb(lv_event_t *e);
 void settings_time_apply_event_cb(lv_event_t *e);
-void create_file_browser_screen();
 void populate_file_browser(const char *path);
 void files_item_event_cb(lv_event_t *e);
 void files_back_event_cb(lv_event_t *e);
@@ -380,6 +439,7 @@ void create_fx_library_panel(lv_obj_t *parent);
 void refresh_fx_library();
 void fx_library_item_event_cb(lv_event_t *e);
 void send_timeline_command(CommandType type, uint32_t position = 0, uint16_t value = 0);
+bool send_addon_action(uint8_t addonId, uint8_t action, uint16_t param = 0, uint16_t aux = 0);
 bool send_showduino_command(const ShowduinoCommand &cmd);
 bool init_esp_now();
 void forget_brain_peer();
@@ -392,6 +452,9 @@ bool init_storage();
 bool ensure_show_library_dir();
 bool load_show_library_from_storage();
 bool save_builder_to_storage(const char *name);
+void addon_slider_event_cb(lv_event_t *e);
+void addon_button_event_cb(lv_event_t *e);
+void addon_dropdown_event_cb(lv_event_t *e);
 
 // LVGL callbacks
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p);
@@ -1501,6 +1564,319 @@ void builder_save_event_cb(lv_event_t *e) {
 }
 
 // ────────────────────────────────────────────────────────────────
+//  ADD-ONS REGISTRY & UI
+// ────────────────────────────────────────────────────────────────
+
+static void addon_build_smoke(AddonCardContext *ctx);
+static void addon_build_pixels(AddonCardContext *ctx);
+static void addon_build_relay(AddonCardContext *ctx);
+static void addon_build_mp3(AddonCardContext *ctx);
+static void addon_build_r3(AddonCardContext *ctx);
+static void addon_refresh_pixels(AddonCardContext *ctx, const ShowduinoStatus &status);
+static void addon_refresh_relay(AddonCardContext *ctx, const ShowduinoStatus &status);
+static void addon_refresh_mp3(AddonCardContext *ctx, const ShowduinoStatus &status);
+static void addon_refresh_noop(AddonCardContext *, const ShowduinoStatus &) {}
+
+static const AddonDefinition addonDefinitions[] = {
+  {"Smoke Control", "Mechanical", 10, addon_build_smoke, addon_refresh_noop},
+  {"NeoPixel Lines", "Lighting", 11, addon_build_pixels, addon_refresh_pixels},
+  {"Relay Expander", "Mechanical", 12, addon_build_relay, addon_refresh_relay},
+  {"MP3 Player A/B", "Audio", 13, addon_build_mp3, addon_refresh_mp3},
+  {"R3 Terminal FX", "Prop FX", 14, addon_build_r3, addon_refresh_noop}
+};
+static constexpr size_t addonDefinitionCount = sizeof(addonDefinitions) / sizeof(AddonDefinition);
+
+void addon_slider_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  auto *payload = static_cast<AddonEventPayload *>(lv_event_get_user_data(e));
+  if (!payload || !payload->ctx) return;
+  if (payload->ctx->updating) return;
+  lv_obj_t *slider = lv_event_get_target(e);
+  uint16_t value = lv_slider_get_value(slider);
+  yield();
+  send_addon_action(payload->ctx->addonId, payload->action, value, payload->aux);
+}
+
+void addon_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  auto *payload = static_cast<AddonEventPayload *>(lv_event_get_user_data(e));
+  if (!payload || !payload->ctx) return;
+  uint16_t param = payload->aux;
+  if (payload->action == ADDON_SMOKE_TRIGGER && payload->ctx->controls.sliderPrimary) {
+    param = lv_slider_get_value(payload->ctx->controls.sliderPrimary);
+  }
+  yield();
+  send_addon_action(payload->ctx->addonId, payload->action, param, payload->aux);
+}
+
+void addon_dropdown_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  auto *payload = static_cast<AddonEventPayload *>(lv_event_get_user_data(e));
+  if (!payload || !payload->ctx) return;
+  lv_obj_t *dd = lv_event_get_target(e);
+  uint16_t selected = lv_dropdown_get_selected(dd);
+  yield();
+  send_addon_action(payload->ctx->addonId, payload->action, selected, payload->aux);
+}
+
+static void addon_create_header(AddonCardContext *ctx) {
+  lv_obj_t *title = lv_label_create(ctx->card);
+  lv_label_set_text_fmt(title, "%s\n(%s)", ctx->def->name, ctx->def->category);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+  yield();
+}
+
+static AddonEventPayload *addon_make_payload(AddonCardContext *ctx, uint8_t action, uint16_t aux = 0) {
+  auto *payload = static_cast<AddonEventPayload *>(lv_mem_alloc(sizeof(AddonEventPayload)));
+  if (!payload) return nullptr;
+  payload->ctx = ctx;
+  payload->action = action;
+  payload->aux = aux;
+  return payload;
+}
+
+static void addon_build_smoke(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+  lv_obj_t *slider = lv_slider_create(ctx->card);
+  lv_slider_set_range(slider, 0, 255);
+  ctx->controls.sliderPrimary = slider;
+  if (auto payload = addon_make_payload(ctx, ADDON_SMOKE_INTENSITY)) {
+    lv_obj_add_event_cb(slider, addon_slider_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  lv_obj_t *btnBurst = lv_btn_create(ctx->card);
+  lv_obj_set_width(btnBurst, LV_PCT(100));
+  lv_obj_t *burstLabel = lv_label_create(btnBurst);
+  lv_label_set_text(burstLabel, "Burst 3s");
+  lv_obj_center(burstLabel);
+  if (auto payload = addon_make_payload(ctx, ADDON_SMOKE_TRIGGER)) {
+    lv_obj_add_event_cb(btnBurst, addon_button_event_cb, LV_EVENT_CLICKED, payload);
+  }
+  yield();
+
+  lv_obj_t *btnPurge = lv_btn_create(ctx->card);
+  lv_obj_set_width(btnPurge, LV_PCT(100));
+  lv_obj_t *purgeLabel = lv_label_create(btnPurge);
+  lv_label_set_text(purgeLabel, "Purge/Vent");
+  lv_obj_center(purgeLabel);
+  if (auto payload = addon_make_payload(ctx, ADDON_SMOKE_PURGE)) {
+    lv_obj_add_event_cb(btnPurge, addon_button_event_cb, LV_EVENT_CLICKED, payload);
+  }
+  yield();
+}
+
+static void addon_build_pixels(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+  lv_obj_t *slider = lv_slider_create(ctx->card);
+  lv_slider_set_range(slider, 0, 255);
+  ctx->controls.sliderPrimary = slider;
+  if (auto payload = addon_make_payload(ctx, ADDON_PIXELS_BRIGHTNESS, 0)) {
+    lv_obj_add_event_cb(slider, addon_slider_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  lv_obj_t *effect = lv_dropdown_create(ctx->card);
+  lv_dropdown_set_options(effect, "Solid\nPulse\nFade\nGlitch\nChase");
+  ctx->controls.dropdown = effect;
+  if (auto payload = addon_make_payload(ctx, ADDON_PIXELS_EFFECT)) {
+    lv_obj_add_event_cb(effect, addon_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+}
+
+static void addon_build_relay(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+  lv_obj_t *grid = lv_obj_create(ctx->card);
+  lv_obj_set_size(grid, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_style_pad_column(grid, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(grid, 6, LV_PART_MAIN);
+  yield();
+
+  for (uint8_t i = 0; i < 8 && i < 16; ++i) {
+    lv_obj_t *btn = lv_btn_create(grid);
+    lv_obj_set_size(btn, 120, 50);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text_fmt(lbl, "Relay %u", static_cast<unsigned>(i + 1));
+    lv_obj_center(lbl);
+    ctx->controls.toggleButtons[i] = btn;
+    if (auto payload = addon_make_payload(ctx, ADDON_RELAY_TOGGLE_BASE + i)) {
+      lv_obj_add_event_cb(btn, addon_button_event_cb, LV_EVENT_CLICKED, payload);
+    }
+    yield();
+  }
+}
+
+static void addon_build_mp3(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+
+  lv_obj_t *volumeALabel = lv_label_create(ctx->card);
+  lv_label_set_text(volumeALabel, "Deck A Volume");
+  lv_obj_set_style_text_color(volumeALabel, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  yield();
+
+  lv_obj_t *sliderA = lv_slider_create(ctx->card);
+  lv_slider_set_range(sliderA, 0, 255);
+  ctx->controls.sliderPrimary = sliderA;
+  if (auto payload = addon_make_payload(ctx, ADDON_MP3_VOLUME_A, 0)) {
+    lv_obj_add_event_cb(sliderA, addon_slider_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  lv_obj_t *volumeBLabel = lv_label_create(ctx->card);
+  lv_label_set_text(volumeBLabel, "Deck B Volume");
+  lv_obj_set_style_text_color(volumeBLabel, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  yield();
+
+  lv_obj_t *sliderB = lv_slider_create(ctx->card);
+  lv_slider_set_range(sliderB, 0, 255);
+  ctx->controls.sliderSecondary = sliderB;
+  if (auto payload = addon_make_payload(ctx, ADDON_MP3_VOLUME_B, 1)) {
+    lv_obj_add_event_cb(sliderB, addon_slider_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  auto makeMp3Button = [&](const char *text, uint8_t action, uint16_t aux) {
+    lv_obj_t *btn = lv_btn_create(ctx->card);
+    lv_obj_set_size(btn, LV_PCT(100), 44);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_center(lbl);
+    if (auto payload = addon_make_payload(ctx, action, aux)) {
+      lv_obj_add_event_cb(btn, addon_button_event_cb, LV_EVENT_CLICKED, payload);
+    }
+    yield();
+  };
+
+  makeMp3Button("Play Deck A", ADDON_MP3_PLAY, 0);
+  makeMp3Button("Stop Deck A", ADDON_MP3_STOP, 0);
+  makeMp3Button("Play Deck B", ADDON_MP3_PLAY, 1);
+  makeMp3Button("Stop Deck B", ADDON_MP3_STOP, 1);
+  makeMp3Button("Sync Library", ADDON_MP3_SYNC, 0);
+}
+
+static void addon_build_r3(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+  lv_obj_t *dropdown = lv_dropdown_create(ctx->card);
+  lv_dropdown_set_options(dropdown, "Glitch\nShock\nTime Flicker\nFade Out");
+  ctx->controls.dropdown = dropdown;
+  if (auto payload = addon_make_payload(ctx, ADDON_R3_PRESET)) {
+    lv_obj_add_event_cb(dropdown, addon_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+}
+
+static void addon_refresh_pixels(AddonCardContext *ctx, const ShowduinoStatus &status) {
+  if (!ctx || !ctx->controls.sliderPrimary) return;
+  ctx->updating = true;
+  uint16_t value = status.ledBrightness[0];
+  if (value > 255) value = 255;
+  lv_slider_set_value(ctx->controls.sliderPrimary, value, LV_ANIM_OFF);
+  ctx->updating = false;
+  yield();
+}
+
+static void addon_refresh_relay(AddonCardContext *ctx, const ShowduinoStatus &status) {
+  if (!ctx) return;
+  for (uint8_t i = 0; i < 8; ++i) {
+    lv_obj_t *btn = ctx->controls.toggleButtons[i];
+    if (!btn) continue;
+    if (status.relays[i]) {
+      lv_obj_add_state(btn, LV_STATE_CHECKED);
+    } else {
+      lv_obj_clear_state(btn, LV_STATE_CHECKED);
+    }
+    yield();
+  }
+}
+
+static void addon_refresh_mp3(AddonCardContext *ctx, const ShowduinoStatus &status) {
+  if (!ctx) return;
+  ctx->updating = true;
+  if (ctx->controls.sliderPrimary) {
+    lv_slider_set_value(ctx->controls.sliderPrimary, status.mp3Vol[0], LV_ANIM_OFF);
+  }
+  if (ctx->controls.sliderSecondary) {
+    lv_slider_set_value(ctx->controls.sliderSecondary, status.mp3Vol[1], LV_ANIM_OFF);
+  }
+  ctx->updating = false;
+  yield();
+}
+
+void create_addons_screen() {
+  Serial.println("[UI] Creating add-ons library...");
+  yield();
+
+  screen_addons = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen_addons, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(screen_addons, 16, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(screen_addons, LV_SCROLLBAR_MODE_AUTO);
+  yield();
+
+  lv_obj_t *header = lv_label_create(screen_addons);
+  lv_label_set_text(header, LV_SYMBOL_LIST " ADD-ONS");
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_26, LV_PART_MAIN);
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_align(header, LV_ALIGN_TOP_LEFT, 10, 10);
+  yield();
+
+  lv_obj_t *btn_back = lv_btn_create(screen_addons);
+  lv_obj_set_size(btn_back, 110, 48);
+  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -10, 6);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn_back, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_back, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_back, settings_back_event_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *label_back = lv_label_create(btn_back);
+  lv_label_set_text(label_back, LV_SYMBOL_LEFT " BACK");
+  lv_obj_center(label_back);
+  yield();
+
+  lv_obj_t *grid = lv_obj_create(screen_addons);
+  lv_obj_set_size(grid, SCREEN_W - 32, SCREEN_H - 150);
+  lv_obj_align(grid, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_color(grid, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(grid, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(grid, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(grid, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(grid, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(grid, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_column(grid, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  yield();
+
+  addonCardCount = 0;
+  for (size_t i = 0; i < addonDefinitionCount && addonCardCount < MAX_ADDONS; ++i) {
+    const AddonDefinition *def = &addonDefinitions[i];
+    AddonCardContext *ctx = &addonCardContexts[addonCardCount++];
+    memset(ctx, 0, sizeof(AddonCardContext));
+    ctx->def = def;
+    ctx->addonId = def->id;
+
+    lv_obj_t *card = lv_obj_create(grid);
+    ctx->card = card;
+    lv_obj_set_size(card, (SCREEN_W - 80) / 2, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(GORE_RED), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    yield();
+
+    if (def->buildFn) {
+      def->buildFn(ctx);
+    }
+    yield();
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
 //  SETTINGS SCREEN
 // ────────────────────────────────────────────────────────────────
 void create_settings_screen() {
@@ -2139,6 +2515,20 @@ void send_timeline_command(CommandType type, uint32_t position, uint16_t value) 
   }
 }
 
+bool send_addon_action(uint8_t addonId, uint8_t action, uint16_t param, uint16_t aux) {
+  ShowduinoCommand cmd{};
+  cmd.type = CMD_ADDON_ACTION;
+  cmd.id = addonId;
+  cmd.value = param;
+  cmd.position = ((uint32_t)action << 16) | aux;
+  bool ok = send_showduino_command(cmd);
+  if (!ok) {
+    show_toast("Add-on command failed", 2500);
+  }
+  yield();
+  return ok;
+}
+
 // ────────────────────────────────────────────────────────────────
 //  STATUS PROCESSING
 // ────────────────────────────────────────────────────────────────
@@ -2430,6 +2820,15 @@ void update_diagnostics_panel(const ShowduinoStatus &status) {
       lv_label_set_text_fmt(diag_last_update_label, "Last Status: %lu ms ago",
                             static_cast<unsigned long>(age));
     }
+  }
+}
+
+void update_addon_cards(const ShowduinoStatus &status) {
+  for (size_t i = 0; i < addonCardCount; ++i) {
+    AddonCardContext *ctx = &addonCardContexts[i];
+    if (!ctx || !ctx->def || !ctx->def->refreshFn) continue;
+    ctx->def->refreshFn(ctx, status);
+    yield();
   }
 }
 
