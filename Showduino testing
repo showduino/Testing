@@ -459,6 +459,9 @@ bool save_builder_to_storage(const char *name);
 void addon_slider_event_cb(lv_event_t *e);
 void addon_button_event_cb(lv_event_t *e);
 void addon_dropdown_event_cb(lv_event_t *e);
+void scan_i2c_bus();
+bool addon_is_available(const AddonDefinition *def);
+void update_addon_availability();
 
 // LVGL callbacks
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p);
@@ -687,6 +690,52 @@ bool save_builder_to_storage(const char *name) {
   }
   Serial.printf("[STORAGE] ✓ Builder arrangement saved to %s\n", path.c_str());
   return true;
+}
+
+void scan_i2c_bus() {
+  memset(i2cDevicePresent, 0, sizeof(i2cDevicePresent));
+  Serial.println("[I2C] Scanning bus for add-ons...");
+  for (uint8_t addr = 1; addr < 0x7F; ++addr) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      i2cDevicePresent[addr] = true;
+      Serial.printf("[I2C] ✓ Detected device at 0x%02X\n", addr);
+    }
+    yield();
+  }
+}
+
+bool addon_is_available(const AddonDefinition *def) {
+  if (!def) return false;
+  if (!def->requiresI2C) return true;
+  if (def->i2cAddress == 0) return false;
+  uint8_t addr = def->i2cAddress & 0x7F;
+  return i2cDevicePresent[addr];
+}
+
+void update_addon_availability() {
+  for (size_t i = 0; i < addonDefinitionCount && i < MAX_ADDONS; ++i) {
+    const AddonDefinition *def = &addonDefinitions[i];
+    bool available = addon_is_available(def);
+    addonAvailable[i] = available;
+    if (def->requiresI2C) {
+      Serial.printf("[ADDON] %s %s (I2C 0x%02X) -> %s\n",
+                    def->name,
+                    def->category,
+                    def->i2cAddress,
+                    available ? "available" : "missing");
+    } else {
+      Serial.printf("[ADDON] %s %s -> %s\n",
+                    def->name,
+                    def->category,
+                    available ? "enabled" : "disabled");
+    }
+    yield();
+  }
+  for (size_t i = addonDefinitionCount; i < MAX_ADDONS; ++i) {
+    addonAvailable[i] = false;
+  }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -929,6 +978,15 @@ void create_main_menu() {
       lv_scr_load_anim(screen_builder, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
     } else {
       Serial.println("[UI] Builder screen not initialised yet.");
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btn_addons = make_button(menu_panel, LV_SYMBOL_PLUG " ADD-ONS");
+  lv_obj_add_event_cb(btn_addons, [](lv_event_t *e) {
+    if (screen_addons) {
+      lv_scr_load_anim(screen_addons, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    } else {
+      Serial.println("[UI] Add-ons screen not initialised yet.");
     }
   }, LV_EVENT_CLICKED, NULL);
 
@@ -1814,6 +1872,8 @@ void create_addons_screen() {
   Serial.println("[UI] Creating add-ons library...");
   yield();
 
+  update_addon_availability();
+
   screen_addons = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(screen_addons, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
   lv_obj_set_style_pad_all(screen_addons, 16, LV_PART_MAIN);
@@ -1854,8 +1914,13 @@ void create_addons_screen() {
   yield();
 
   addonCardCount = 0;
+  int availableCount = 0;
+
   for (size_t i = 0; i < addonDefinitionCount && addonCardCount < MAX_ADDONS; ++i) {
     const AddonDefinition *def = &addonDefinitions[i];
+    bool available = (i < MAX_ADDONS) ? addonAvailable[i] : addon_is_available(def);
+    if (!available) continue;
+    availableCount++;
     AddonCardContext *ctx = &addonCardContexts[addonCardCount++];
     memset(ctx, 0, sizeof(AddonCardContext));
     ctx->def = def;
@@ -1876,6 +1941,17 @@ void create_addons_screen() {
     if (def->buildFn) {
       def->buildFn(ctx);
     }
+    yield();
+  }
+
+  if (availableCount == 0) {
+    lv_obj_t *msg = lv_label_create(grid);
+    lv_label_set_text(msg,
+                      "No compatible add-ons detected.\n"
+                      "Connect hardware and rescan (power cycle).");
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_18, LV_PART_MAIN);
+    lv_obj_center(msg);
     yield();
   }
 }
@@ -2347,16 +2423,21 @@ void build_ui_incremental() {
       uiStage++;
       break;
     case 5:
-      Serial.println("[UI] Stage 5 → Builder");
-      create_builder_screen();
+      Serial.println("[UI] Stage 5 → Add-ons");
+      create_addons_screen();
       uiStage++;
       break;
     case 6:
-      Serial.println("[UI] Stage 6 → Diagnostics");
-      create_diagnostics_screen();
+      Serial.println("[UI] Stage 6 → Builder");
+      create_builder_screen();
       uiStage++;
       break;
     case 7:
+      Serial.println("[UI] Stage 7 → Diagnostics");
+      create_diagnostics_screen();
+      uiStage++;
+      break;
+    case 8:
       Serial.println("[UI] ✓ All screens created");
       uiCreated = true;
       uiStage++;
@@ -2557,6 +2638,7 @@ void handle_status_queue() {
     update_live_controls(latestStatus);
     update_diagnostics_panel(latestStatus);
     update_link_indicator();
+    update_addon_cards(latestStatus);
   }
 }
 
@@ -2831,6 +2913,7 @@ void update_addon_cards(const ShowduinoStatus &status) {
   for (size_t i = 0; i < addonCardCount; ++i) {
     AddonCardContext *ctx = &addonCardContexts[i];
     if (!ctx || !ctx->def || !ctx->def->refreshFn) continue;
+    if (ctx->def->requiresI2C && !addon_is_available(ctx->def)) continue;
     ctx->def->refreshFn(ctx, status);
     yield();
   }
@@ -3041,7 +3124,7 @@ void setup() {
   }
 
   showBootScreen(1, "Display ready");
-  Serial.println("[1/6] ✓ Display initialised");
+  Serial.println("[1/7] ✓ Display initialised");
   delay(200);
 
   Serial.println("[BOOT] Initialising LVGL...");
@@ -3050,7 +3133,7 @@ void setup() {
     while (true) delay(1000);
   }
   showBootScreen(2, "LVGL ready");
-  Serial.println("[2/6] ✓ LVGL ready");
+  Serial.println("[2/7] ✓ LVGL ready");
   delay(200);
 
   Serial.println("[BOOT] Initialising GT911 touch...");
@@ -3061,7 +3144,7 @@ void setup() {
     while (true) delay(1000);
   }
   showBootScreen(3, "Touch ready");
-  Serial.println("[3/6] ✓ Touch ready");
+  Serial.println("[3/7] ✓ Touch ready");
   delay(200);
 
   Serial.println("[BOOT] Initialising ESP-NOW link...");
@@ -3071,21 +3154,33 @@ void setup() {
     while (true) delay(1000);
   }
   showBootScreen(4, "ESP-NOW ready");
-  Serial.println("[4/6] ✓ ESP-NOW ready");
+  Serial.println("[4/7] ✓ ESP-NOW ready");
   delay(200);
 
   showBootScreen(5, "Mounting storage…");
   Serial.println("[BOOT] Mounting storage (SD first)...");
   if (init_storage()) {
-    Serial.println("[5/6] ✓ SD storage ready");
+    Serial.println("[5/7] ✓ SD storage ready");
   } else {
-    Serial.println("[5/6] ⚠️ SD storage unavailable, using RAM-only assets");
+    Serial.println("[5/7] ⚠️ SD storage unavailable, using RAM-only assets");
   }
   delay(200);
 
-  showBootScreen(6, "Building UI…");
+  showBootScreen(6, "Scanning add-ons…");
+  Serial.println("[BOOT] Scanning I2C bus for add-ons");
+  scan_i2c_bus();
+  update_addon_availability();
+  if (init_rtc()) {
+    Serial.println("[RTC] ✓ DS3231 ready");
+  } else {
+    Serial.println("[RTC] ⚠️ DS3231 not detected");
+  }
+  Serial.println("[6/7] ✓ Add-on scan complete");
+  delay(200);
+
+  showBootScreen(7, "Building UI…");
   Serial.println("[BOOT] Launching deferred UI build");
-  Serial.println("[6/6] ✓ UI pipeline scheduled");
+  Serial.println("[7/7] ✓ UI pipeline scheduled");
 
   systemReady = true;
 }
