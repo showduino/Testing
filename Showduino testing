@@ -292,6 +292,8 @@ struct AddonDefinition {
   uint8_t id;
   AddonBuildFn buildFn;
   AddonRefreshFn refreshFn;
+  uint8_t i2cAddress;
+  bool requiresI2C;
 };
 
 struct AddonControlRefs {
@@ -320,6 +322,8 @@ static constexpr size_t MAX_ADDONS = 8;
 static AddonCardContext addonCardContexts[MAX_ADDONS];
 static size_t addonCardCount = 0;
 static bool updatingAddonUi = false;
+static bool addonAvailable[MAX_ADDONS] = {false};
+static bool i2cDevicePresent[128] = {false};
 
 // User-data backing arrays (stable memory for LVGL callbacks)
 static uint8_t relayIdMap[8] = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -1578,11 +1582,11 @@ static void addon_refresh_mp3(AddonCardContext *ctx, const ShowduinoStatus &stat
 static void addon_refresh_noop(AddonCardContext *, const ShowduinoStatus &) {}
 
 static const AddonDefinition addonDefinitions[] = {
-  {"Smoke Control", "Mechanical", 10, addon_build_smoke, addon_refresh_noop},
-  {"NeoPixel Lines", "Lighting", 11, addon_build_pixels, addon_refresh_pixels},
-  {"Relay Expander", "Mechanical", 12, addon_build_relay, addon_refresh_relay},
-  {"MP3 Player A/B", "Audio", 13, addon_build_mp3, addon_refresh_mp3},
-  {"R3 Terminal FX", "Prop FX", 14, addon_build_r3, addon_refresh_noop}
+  {"Smoke Control", "Mechanical", 10, addon_build_smoke, addon_refresh_noop, 0x2A, true},
+  {"NeoPixel Lines", "Lighting", 11, addon_build_pixels, addon_refresh_pixels, 0x00, false},
+  {"Relay Expander", "Mechanical", 12, addon_build_relay, addon_refresh_relay, 0x3E, true},
+  {"MP3 Player A/B", "Audio", 13, addon_build_mp3, addon_refresh_mp3, 0x00, false},
+  {"R3 Terminal FX", "Prop FX", 14, addon_build_r3, addon_refresh_noop, 0x41, true}
 };
 static constexpr size_t addonDefinitionCount = sizeof(addonDefinitions) / sizeof(AddonDefinition);
 
