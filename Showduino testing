@@ -204,6 +204,9 @@ static lv_obj_t *builder_timeline_area = nullptr;
 static lv_obj_t *builder_name_field = nullptr;
 static lv_obj_t *builder_status_label = nullptr;
 static lv_obj_t *builder_save_button = nullptr;
+static lv_obj_t *toast_container = nullptr;
+static lv_obj_t *keyboard = nullptr;
+static lv_obj_t *keyboard_target = nullptr;
 
 struct ShowEntry {
   lv_obj_t *widget;
@@ -290,6 +293,8 @@ static constexpr lv_coord_t BUILDER_CLIP_WIDTH = 180;
 static constexpr lv_coord_t BUILDER_CLIP_HEIGHT = 60;
 static constexpr uint32_t BUILDER_TIMELINE_MS = 600000;
 
+static lv_timer_t *toast_timer = nullptr;
+
 // ────────────────────────────────────────────────────────────────
 //  FORWARD DECLARATIONS
 // ────────────────────────────────────────────────────────────────
@@ -315,6 +320,10 @@ void builder_clear_workspace();
 void builder_reset_show_item(ShowEntry *entry);
 void builder_add_clip(const char *name, uint32_t startMs, uint8_t lane);
 void builder_clear_event_cb(lv_event_t *e);
+void show_toast(const char *message, uint32_t duration_ms = 2000);
+void hide_toast();
+void attach_keyboard(lv_obj_t *target);
+void detach_keyboard();
 bool send_showduino_command(const ShowduinoCommand &cmd);
 bool init_esp_now();
 void forget_brain_peer();
@@ -419,7 +428,15 @@ bool init_storage() {
     sdMounted = true;
     storageReady = true;
     Serial.println("[STORAGE] SD card mounted as primary storage");
-    ensure_show_library_dir();
+      ensure_show_library_dir();
+      const char *registryPath = "/builder/registry.txt";
+      if (!SD.exists(registryPath)) {
+        File regFile = SD.open(registryPath, FILE_WRITE);
+        if (regFile) {
+          regFile.println("# Show Registry");
+          regFile.close();
+        }
+      }
     return true;
   }
 
@@ -522,8 +539,70 @@ bool save_builder_to_storage(const char *name) {
   }
   file.print("]}");
   file.close();
+  String registryPath = String(BUILDER_EXPORT_DIR) + "/registry.txt";
+  File registry = SD.open(registryPath.c_str(), FILE_APPEND);
+  if (registry) {
+    registry.printf("%s.show\n", safeName);
+    registry.close();
+  }
   Serial.printf("[STORAGE] ✓ Builder arrangement saved to %s\n", path.c_str());
   return true;
+}
+
+// ────────────────────────────────────────────────────────────────
+//  UI FEEDBACK HELPERS
+// ────────────────────────────────────────────────────────────────
+static void toast_timer_cb(lv_timer_t *timer) {
+  (void)timer;
+  hide_toast();
+}
+
+void hide_toast() {
+  if (!toast_container) return;
+  lv_obj_add_flag(toast_container, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t *label = lv_obj_get_child(toast_container, 0);
+  if (label) lv_label_set_text(label, "");
+  if (toast_timer) {
+    lv_timer_del(toast_timer);
+    toast_timer = nullptr;
+  }
+}
+
+void show_toast(const char *message, uint32_t duration_ms) {
+  if (!toast_container) return;
+  lv_obj_clear_flag(toast_container, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t *label = lv_obj_get_child(toast_container, 0);
+  if (label) {
+    lv_label_set_text(label, message ? message : "");
+    lv_obj_center(label);
+  }
+  if (toast_timer) {
+    lv_timer_set_period(toast_timer, duration_ms);
+    lv_timer_reset(toast_timer);
+  } else {
+    toast_timer = lv_timer_create(toast_timer_cb, duration_ms, nullptr);
+  }
+}
+
+void attach_keyboard(lv_obj_t *target) {
+  if (!target) return;
+  if (!keyboard) {
+    keyboard = lv_keyboard_create(lv_scr_act());
+    lv_obj_set_size(keyboard, SCREEN_W, SCREEN_H / 3);
+    lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+  }
+  keyboard_target = target;
+  lv_keyboard_set_textarea(keyboard, target);
+  lv_obj_clear_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+void detach_keyboard() {
+  if (!keyboard) return;
+  lv_keyboard_set_textarea(keyboard, nullptr);
+  lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+  keyboard_target = nullptr;
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1121,6 +1200,7 @@ void builder_add_clip(const char *name, uint32_t startMs, uint8_t lane) {
     if (builder_status_label) {
       lv_label_set_text(builder_status_label, "Clip limit reached (64)");
     }
+    show_toast("Clip limit reached – delete a clip to add more", 2500);
     return;
   }
 
@@ -1156,6 +1236,7 @@ void builder_add_clip(const char *name, uint32_t startMs, uint8_t lane) {
              static_cast<unsigned long>(clip.startMs));
     lv_label_set_text(builder_status_label, msg);
   }
+  show_toast("Cue added to timeline");
 }
 
 void refresh_show_library() {
@@ -1229,8 +1310,11 @@ void builder_show_item_event_cb(lv_event_t *e) {
         }
     }
     builder_reset_show_item(entry);
-    if (!dropped && builder_status_label) {
-      lv_label_set_text(builder_status_label, "Cue returned to library.");
+    if (!dropped) {
+      if (builder_status_label) {
+        lv_label_set_text(builder_status_label, "Cue returned to library.");
+      }
+      show_toast("Cue returned to library");
     }
   }
 }
@@ -1255,6 +1339,7 @@ void builder_clear_event_cb(lv_event_t *e) {
   if (builder_status_label) {
     lv_label_set_text(builder_status_label, "Workspace cleared.");
   }
+  show_toast("Builder workspace cleared");
 }
 
 void builder_save_event_cb(lv_event_t *e) {
@@ -1264,11 +1349,13 @@ void builder_save_event_cb(lv_event_t *e) {
   const char *name = lv_textarea_get_text(builder_name_field);
   if (!name || strlen(name) == 0) {
     lv_label_set_text(builder_status_label, "Enter a show name before saving.");
+    show_toast("Enter a show name before saving");
     return;
   }
 
   if (builderClipCount == 0) {
     lv_label_set_text(builder_status_label, "Add at least one clip before saving.");
+    show_toast("Builder needs at least one cue before saving");
     return;
   }
 
@@ -1276,8 +1363,11 @@ void builder_save_event_cb(lv_event_t *e) {
     load_show_library_from_storage();
     refresh_show_library();
     lv_label_set_text(builder_status_label, "Show saved to SD card.");
+    show_toast("Show arrangement saved to SD card");
+    detach_keyboard();
   } else {
     lv_label_set_text(builder_status_label, "Failed to write show to SD card.");
+    show_toast("Failed to save show – check SD card", 3000);
   }
 }
 
@@ -1595,6 +1685,13 @@ void create_builder_screen() {
   lv_obj_set_size(builder_name_field, 200, 40);
   lv_textarea_set_placeholder_text(builder_name_field, "Show Name");
   lv_textarea_set_one_line(builder_name_field, true);
+  lv_obj_add_event_cb(builder_name_field, [](lv_event_t *evt) {
+    if (evt->code == LV_EVENT_FOCUSED) {
+      attach_keyboard(builder_name_field);
+    } else if (evt->code == LV_EVENT_DEFOCUSED) {
+      detach_keyboard();
+    }
+  }, LV_EVENT_ALL, nullptr);
 
   lv_obj_t *btn_save = lv_btn_create(top_bar);
   builder_save_button = btn_save;
@@ -1681,6 +1778,22 @@ void create_builder_screen() {
   lv_label_set_text(builder_status_label, "Drag cues into the timeline to build a show.");
   lv_obj_set_style_text_font(builder_status_label, &lv_font_montserrat_16, LV_PART_MAIN);
   lv_obj_align(builder_status_label, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+
+  toast_container = lv_obj_create(screen_builder);
+  lv_obj_set_size(toast_container, SCREEN_W - 80, 60);
+  lv_obj_align(toast_container, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_set_style_bg_color(toast_container, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(toast_container, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_set_style_radius(toast_container, 12, LV_PART_MAIN);
+  lv_obj_set_style_border_width(toast_container, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(toast_container, 12, LV_PART_MAIN);
+  lv_obj_add_flag(toast_container, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t *toast_label = lv_label_create(toast_container);
+  lv_label_set_text(toast_label, "");
+  lv_obj_set_style_text_font(toast_label, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_align(toast_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_center(toast_label);
 
   builder_clear_workspace();
   load_show_library_from_storage();
@@ -2321,6 +2434,7 @@ void settings_ping_event_cb(lv_event_t *e) {
 
 void settings_back_event_cb(lv_event_t *e) {
   (void)e;
+  detach_keyboard();
   if (screen_main) {
     lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
   }
