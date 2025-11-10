@@ -84,7 +84,7 @@ constexpr uint32_t GORE_PANEL_BG = 0x111111;
 constexpr uint32_t GORE_SLATE = 0x1C1C1C;
 
 #ifndef SD_CS_PIN
-#define SD_CS_PIN 12
+#define SD_CS_PIN 10
 #endif
 
 static constexpr const char *SHOW_LIBRARY_DIR = "/shows";
