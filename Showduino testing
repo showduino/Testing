@@ -148,6 +148,8 @@ static lv_obj_t *screen_main = nullptr;
 static lv_obj_t *screen_timeline = nullptr;
 static lv_obj_t *screen_fx_designer = nullptr;
 static lv_obj_t *screen_live_control = nullptr;
+static lv_obj_t *screen_settings = nullptr;
+static lv_obj_t *screen_diagnostics = nullptr;
 static lv_obj_t *crosshair = nullptr;
 
 // Live Control UI elements
@@ -162,6 +164,26 @@ static lv_obj_t *relayButtons[8] = {nullptr};
 static lv_obj_t *mp3VolumeSlider[2] = {nullptr};
 static lv_obj_t *mp3StateLabel[2] = {nullptr};
 static lv_obj_t *ledSlider[4] = {nullptr};
+
+// Settings UI elements
+static lv_obj_t *settings_brightness_slider = nullptr;
+static lv_obj_t *settings_brightness_value = nullptr;
+static lv_obj_t *settings_autopair_switch = nullptr;
+static lv_obj_t *settings_autopair_label = nullptr;
+static lv_obj_t *settings_txpower_slider = nullptr;
+static lv_obj_t *settings_txpower_value = nullptr;
+static lv_obj_t *settings_channel_label = nullptr;
+static lv_obj_t *settings_peer_label = nullptr;
+static lv_obj_t *settings_last_status_label = nullptr;
+static lv_obj_t *settings_ping_label = nullptr;
+
+// Diagnostics UI elements
+static lv_obj_t *diag_mode_label = nullptr;
+static lv_obj_t *diag_relay_label = nullptr;
+static lv_obj_t *diag_mp3_label = nullptr;
+static lv_obj_t *diag_led_label = nullptr;
+static lv_obj_t *diag_timeline_label = nullptr;
+static lv_obj_t *diag_last_update_label = nullptr;
 
 // User-data backing arrays (stable memory for LVGL callbacks)
 static uint8_t relayIdMap[8] = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -181,6 +203,9 @@ static bool uiCreated = false;
 static int uiStage = 0;
 static bool espNowReady = false;
 static bool brainPeerKnown = false;
+static bool autoPairEnabled = true;
+static int currentTxPower = SHOWDUINO_MAX_TX_POWER;
+static uint8_t currentChannel = SHOWDUINO_ESPNOW_CHANNEL;
 static uint8_t brainPeerMac[6] = {0};
 static uint32_t lastStatusMillis = 0;
 static volatile esp_now_send_status_t lastSendStatus = ESP_NOW_SEND_FAIL;
@@ -192,6 +217,18 @@ static volatile bool statusAvailable = false;
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool updatingFromStatus = false;
+static bool updatingSettingsUi = false;
+
+// Backlight control
+constexpr uint8_t BACKLIGHT_PWM_CHANNEL = 0;
+constexpr uint32_t BACKLIGHT_PWM_FREQ = 5000;
+constexpr uint8_t BACKLIGHT_PWM_RESOLUTION = 12;  // 0..4095
+static uint8_t displayBrightness = 255;
+
+// Link diagnostics
+static bool pingPending = false;
+static uint32_t lastPingSendMillis = 0;
+static uint32_t lastPingRoundtrip = 0;
 
 // ────────────────────────────────────────────────────────────────
 //  FORWARD DECLARATIONS
@@ -203,14 +240,20 @@ void create_main_menu();
 void create_timeline_screen();
 void create_fx_designer_screen();
 void create_live_control_screen();
+void create_settings_screen();
+void create_diagnostics_screen();
 void update_live_controls(const ShowduinoStatus &status);
 void update_link_indicator();
+void update_settings_telemetry();
+void update_diagnostics_panel(const ShowduinoStatus &status);
 bool send_showduino_command(const ShowduinoCommand &cmd);
 bool init_esp_now();
 void forget_brain_peer();
 void handle_status_queue();
 void refresh_timeline_readout(uint32_t position);
 void update_mp3_state_label(uint8_t deck, uint8_t state);
+void apply_display_brightness(uint8_t level);
+void init_backlight_pwm();
 
 // LVGL callbacks
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p);
@@ -223,6 +266,12 @@ void mp3_transport_event_cb(lv_event_t *e);
 void led_slider_event_cb(lv_event_t *e);
 void toolbar_event_cb(lv_event_t *e);
 void pair_button_event_cb(lv_event_t *e);
+void settings_brightness_event_cb(lv_event_t *e);
+void settings_autopair_event_cb(lv_event_t *e);
+void settings_txpower_event_cb(lv_event_t *e);
+void settings_ping_event_cb(lv_event_t *e);
+void settings_back_event_cb(lv_event_t *e);
+void diagnostics_back_event_cb(lv_event_t *e);
 
 // ESP-NOW callbacks
 void on_espnow_recv(const uint8_t *mac, const uint8_t *incomingData, int len);
@@ -365,12 +414,24 @@ void create_main_menu() {
   lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_18, LV_PART_MAIN);
   lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 68);
 
-  auto make_button = [](lv_obj_t *parent, const char *text, lv_coord_t y_offset) {
+  lv_obj_t *menu_panel = lv_obj_create(screen_main);
+  lv_obj_set_size(menu_panel, 360, 360);
+  lv_obj_align(menu_panel, LV_ALIGN_CENTER, 0, 30);
+  lv_obj_set_style_bg_color(menu_panel, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(menu_panel, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(menu_panel, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(menu_panel, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(menu_panel, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(menu_panel, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(menu_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_SPACE_AROUND);
+
+  auto make_button = [](lv_obj_t *parent, const char *text) {
     lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_size(btn, 320, 80);
-    lv_obj_align(btn, LV_ALIGN_CENTER, 0, y_offset);
+    lv_obj_set_size(btn, LV_PCT(100), 70);
     lv_obj_set_style_bg_color(btn, lv_color_hex(GORE_RED), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN | LV_STATE_PRESSED);
     lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 10, LV_PART_MAIN);
 
     lv_obj_t *label = lv_label_create(btn);
     lv_label_set_text(label, text);
@@ -379,24 +440,38 @@ void create_main_menu() {
     return btn;
   };
 
-  lv_obj_t *btn_live = make_button(screen_main, LV_SYMBOL_WIFI " LIVE CONTROL", -90);
+  lv_obj_t *btn_live = make_button(menu_panel, LV_SYMBOL_WIFI " LIVE CONTROL");
   lv_obj_add_event_cb(btn_live, [](lv_event_t *e) {
     if (screen_live_control) {
       lv_scr_load_anim(screen_live_control, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
     }
   }, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t *btn_timeline = make_button(screen_main, LV_SYMBOL_PLAY " TIMELINE EDITOR", 10);
+  lv_obj_t *btn_timeline = make_button(menu_panel, LV_SYMBOL_PLAY " TIMELINE EDITOR");
   lv_obj_add_event_cb(btn_timeline, [](lv_event_t *e) {
     if (screen_timeline) {
       lv_scr_load_anim(screen_timeline, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
     }
   }, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t *btn_fx = make_button(screen_main, LV_SYMBOL_IMAGE " FX DESIGNER", 110);
+  lv_obj_t *btn_fx = make_button(menu_panel, LV_SYMBOL_IMAGE " FX DESIGNER");
   lv_obj_add_event_cb(btn_fx, [](lv_event_t *e) {
     if (screen_fx_designer) {
       lv_scr_load_anim(screen_fx_designer, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btn_settings = make_button(menu_panel, LV_SYMBOL_SETTINGS " SETTINGS");
+  lv_obj_add_event_cb(btn_settings, [](lv_event_t *e) {
+    if (screen_settings) {
+      lv_scr_load_anim(screen_settings, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btn_diag = make_button(menu_panel, LV_SYMBOL_LIST " DIAGNOSTICS");
+  lv_obj_add_event_cb(btn_diag, [](lv_event_t *e) {
+    if (screen_diagnostics) {
+      lv_scr_load_anim(screen_diagnostics, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
     }
   }, LV_EVENT_CLICKED, NULL);
 
@@ -782,6 +857,290 @@ void create_live_control_screen() {
 }
 
 // ────────────────────────────────────────────────────────────────
+//  SETTINGS SCREEN
+// ────────────────────────────────────────────────────────────────
+void create_settings_screen() {
+  Serial.println("[UI] Creating settings screen...");
+
+  screen_settings = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen_settings, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(screen_settings, 16, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(screen_settings, LV_SCROLLBAR_MODE_AUTO);
+
+  lv_obj_t *header = lv_label_create(screen_settings);
+  lv_label_set_text(header, LV_SYMBOL_SETTINGS " SETTINGS & LINK");
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_26, LV_PART_MAIN);
+  lv_obj_align(header, LV_ALIGN_TOP_LEFT, 10, 10);
+
+  lv_obj_t *btn_back = lv_btn_create(screen_settings);
+  lv_obj_set_size(btn_back, 110, 48);
+  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -10, 6);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn_back, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_back, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_back, settings_back_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *label_back = lv_label_create(btn_back);
+  lv_label_set_text(label_back, LV_SYMBOL_LEFT " BACK");
+  lv_obj_center(label_back);
+
+  lv_obj_t *content = lv_obj_create(screen_settings);
+  lv_obj_set_size(content, SCREEN_W - 32, SCREEN_H - 120);
+  lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_color(content, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(content, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(content, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(content, 18, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(content, 16, LV_PART_MAIN);
+  lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_row(content, 20, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(content, LV_DIR_VER);
+
+  auto make_card = [](lv_obj_t *parent) {
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_size(card, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 14, LV_PART_MAIN);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(card, 8, LV_PART_MAIN);
+    return card;
+  };
+
+  // Brightness card
+  lv_obj_t *brightness_card = make_card(content);
+  lv_obj_t *brightness_row = lv_obj_create(brightness_card);
+  lv_obj_set_size(brightness_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(brightness_row, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(brightness_row, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(brightness_row, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(brightness_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(brightness_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *brightness_title = lv_label_create(brightness_row);
+  lv_label_set_text(brightness_title, "Display Brightness");
+  lv_obj_set_style_text_font(brightness_title, &lv_font_montserrat_20, LV_PART_MAIN);
+
+  settings_brightness_value = lv_label_create(brightness_row);
+  lv_obj_set_style_text_font(settings_brightness_value, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_brightness_slider = lv_slider_create(brightness_card);
+  lv_obj_set_width(settings_brightness_slider, LV_PCT(100));
+  lv_slider_set_range(settings_brightness_slider, 10, 255);
+  lv_slider_set_value(settings_brightness_slider, displayBrightness, LV_ANIM_OFF);
+  lv_obj_add_event_cb(settings_brightness_slider, settings_brightness_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *brightness_hint = lv_label_create(brightness_card);
+  lv_label_set_text(brightness_hint, "Adjust TFT backlight intensity. Lower for dark FOH booths.");
+  lv_obj_set_style_text_font(brightness_hint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(brightness_hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  // Autopair card
+  lv_obj_t *pair_card = make_card(content);
+  lv_obj_t *pair_row = lv_obj_create(pair_card);
+  lv_obj_set_size(pair_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(pair_row, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(pair_row, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(pair_row, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(pair_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(pair_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *pair_title = lv_label_create(pair_row);
+  lv_label_set_text(pair_title, "Brain Auto-Pair");
+  lv_obj_set_style_text_font(pair_title, &lv_font_montserrat_20, LV_PART_MAIN);
+
+  settings_autopair_switch = lv_switch_create(pair_row);
+  if (autoPairEnabled) {
+    lv_obj_add_state(settings_autopair_switch, LV_STATE_CHECKED);
+  } else {
+    lv_obj_clear_state(settings_autopair_switch, LV_STATE_CHECKED);
+  }
+  lv_obj_add_event_cb(settings_autopair_switch, settings_autopair_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  settings_autopair_label = lv_label_create(pair_card);
+  lv_obj_set_style_text_font(settings_autopair_label, &lv_font_montserrat_16, LV_PART_MAIN);
+
+  lv_obj_t *pair_hint = lv_label_create(pair_card);
+  lv_label_set_text(pair_hint, "When enabled, the desk locks to the first Brain broadcasting status packets.");
+  lv_obj_set_style_text_font(pair_hint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(pair_hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  // TX power card
+  lv_obj_t *power_card = make_card(content);
+  lv_obj_t *power_row = lv_obj_create(power_card);
+  lv_obj_set_size(power_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(power_row, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(power_row, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(power_row, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(power_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(power_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *power_title = lv_label_create(power_row);
+  lv_label_set_text(power_title, "ESP-NOW TX Power");
+  lv_obj_set_style_text_font(power_title, &lv_font_montserrat_20, LV_PART_MAIN);
+
+  settings_txpower_value = lv_label_create(power_row);
+  lv_obj_set_style_text_font(settings_txpower_value, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_txpower_slider = lv_slider_create(power_card);
+  lv_obj_set_width(settings_txpower_slider, LV_PCT(100));
+  lv_slider_set_range(settings_txpower_slider, 8, 78);
+  lv_slider_set_value(settings_txpower_slider, currentTxPower, LV_ANIM_OFF);
+  lv_obj_add_event_cb(settings_txpower_slider, settings_txpower_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *power_hint = lv_label_create(power_card);
+  lv_label_set_text(power_hint, "Set RF output (dBm * 4). Reduce for short-range rehearsals to minimise noise.");
+  lv_obj_set_style_text_font(power_hint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(power_hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  // Link status card
+  lv_obj_t *status_card = make_card(content);
+
+  settings_channel_label = lv_label_create(status_card);
+  lv_obj_set_style_text_font(settings_channel_label, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_peer_label = lv_label_create(status_card);
+  lv_obj_set_style_text_font(settings_peer_label, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_last_status_label = lv_label_create(status_card);
+  lv_obj_set_style_text_font(settings_last_status_label, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_ping_label = lv_label_create(status_card);
+  lv_obj_set_style_text_font(settings_ping_label, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  lv_obj_t *ping_btn = lv_btn_create(status_card);
+  lv_obj_set_size(ping_btn, 180, 50);
+  lv_obj_set_style_bg_color(ping_btn, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(ping_btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(ping_btn, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(ping_btn, settings_ping_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *ping_label = lv_label_create(ping_btn);
+  lv_label_set_text(ping_label, LV_SYMBOL_REFRESH " PING BRAIN");
+  lv_obj_center(ping_label);
+
+  lv_obj_t *status_hint = lv_label_create(status_card);
+  lv_label_set_text(status_hint, "Ping measures round-trip time against the next status frame from the Brain.");
+  lv_obj_set_style_text_font(status_hint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(status_hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  update_settings_telemetry();
+  apply_display_brightness(displayBrightness);
+
+  Serial.println("[UI] Settings screen ready");
+}
+
+// ────────────────────────────────────────────────────────────────
+//  DIAGNOSTICS SCREEN
+// ────────────────────────────────────────────────────────────────
+void create_diagnostics_screen() {
+  Serial.println("[UI] Creating diagnostics screen...");
+
+  screen_diagnostics = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen_diagnostics, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(screen_diagnostics, 16, LV_PART_MAIN);
+
+  lv_obj_t *header = lv_label_create(screen_diagnostics);
+  lv_label_set_text(header, LV_SYMBOL_LIST " LIVE DIAGNOSTICS");
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_26, LV_PART_MAIN);
+  lv_obj_align(header, LV_ALIGN_TOP_LEFT, 10, 10);
+
+  lv_obj_t *btn_back = lv_btn_create(screen_diagnostics);
+  lv_obj_set_size(btn_back, 110, 48);
+  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -10, 6);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn_back, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_back, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_back, diagnostics_back_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *label_back = lv_label_create(btn_back);
+  lv_label_set_text(label_back, LV_SYMBOL_LEFT " BACK");
+  lv_obj_center(label_back);
+
+  lv_obj_t *content = lv_obj_create(screen_diagnostics);
+  lv_obj_set_size(content, SCREEN_W - 32, SCREEN_H - 120);
+  lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_color(content, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(content, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(content, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(content, 18, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(content, 18, LV_PART_MAIN);
+  lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_row(content, 18, LV_PART_MAIN);
+
+  auto make_row = [](lv_obj_t *parent, const char *title, lv_obj_t **valueLabel) {
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *label = lv_label_create(row);
+    lv_label_set_text(label, title);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, LV_PART_MAIN);
+
+    *valueLabel = lv_label_create(row);
+    lv_obj_set_style_text_font(*valueLabel, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(*valueLabel, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+
+    return row;
+  };
+
+  make_row(content, "Mode", &diag_mode_label);
+  make_row(content, "Relays", &diag_relay_label);
+  make_row(content, "MP3 Decks", &diag_mp3_label);
+  make_row(content, "LED Lines", &diag_led_label);
+  make_row(content, "Timeline", &diag_timeline_label);
+  make_row(content, "Last Status", &diag_last_update_label);
+
+  lv_obj_t *button_row = lv_obj_create(content);
+  lv_obj_set_size(button_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(button_row, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(button_row, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(button_row, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(button_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(button_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(button_row, 16, LV_PART_MAIN);
+
+  lv_obj_t *btn_ping = lv_btn_create(button_row);
+  lv_obj_set_size(btn_ping, 180, 50);
+  lv_obj_set_style_bg_color(btn_ping, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_ping, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_ping, settings_ping_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *btn_ping_label = lv_label_create(btn_ping);
+  lv_label_set_text(btn_ping_label, LV_SYMBOL_REFRESH " PING BRAIN");
+  lv_obj_center(btn_ping_label);
+
+  lv_obj_t *btn_resync = lv_btn_create(button_row);
+  lv_obj_set_size(btn_resync, 200, 50);
+  lv_obj_set_style_bg_color(btn_resync, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_resync, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_resync, pair_button_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *btn_resync_label = lv_label_create(btn_resync);
+  lv_label_set_text(btn_resync_label, LV_SYMBOL_REFRESH " FORCE RE-PAIR");
+  lv_obj_center(btn_resync_label);
+
+  lv_obj_t *hint = lv_label_create(content);
+  lv_label_set_text(hint, "Diagnostics mirrors the latest status frame. Use RE-PAIR to drop the current Brain and wait for a fresh handshake.");
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  update_diagnostics_panel(latestStatus);
+
+  Serial.println("[UI] Diagnostics screen ready");
+}
+
+// ────────────────────────────────────────────────────────────────
 //  UI BUILD PIPELINE (Deferred)
 // ────────────────────────────────────────────────────────────────
 void build_ui_incremental() {
@@ -807,6 +1166,16 @@ void build_ui_incremental() {
       uiStage++;
       break;
     case 4:
+      Serial.println("[UI] Stage 4 → Settings");
+      create_settings_screen();
+      uiStage++;
+      break;
+    case 5:
+      Serial.println("[UI] Stage 5 → Diagnostics");
+      create_diagnostics_screen();
+      uiStage++;
+      break;
+    case 6:
       Serial.println("[UI] ✓ All screens created");
       uiCreated = true;
       uiStage++;
@@ -828,6 +1197,8 @@ bool init_esp_now() {
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_wifi_set_max_tx_power(SHOWDUINO_MAX_TX_POWER);
   esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_MCS7_SGI);
+  currentChannel = SHOWDUINO_ESPNOW_CHANNEL;
+  currentTxPower = SHOWDUINO_MAX_TX_POWER;
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("[ESP-NOW] ❌ esp_now_init failed");
@@ -870,6 +1241,15 @@ bool ensure_peer_registered(const uint8_t *mac) {
     return true;
   }
 
+  if (!autoPairEnabled) {
+    if (!brainPeerKnown) {
+      Serial.println("[ESP-NOW] Auto-pair disabled – ignoring unknown Brain");
+      return false;
+    }
+    // Already paired with a different MAC: hold lock, ignore newcommer
+    return false;
+  }
+
   // New peer or changed MAC
   if (brainPeerKnown) {
     esp_now_del_peer(brainPeerMac);
@@ -904,7 +1284,11 @@ void on_espnow_recv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     return;
   }
 
-  ensure_peer_registered(mac);
+  if (!ensure_peer_registered(mac)) {
+    if (!brainPeerKnown || memcmp(mac, brainPeerMac, 6) != 0) {
+      return;
+    }
+  }
 
   portENTER_CRITICAL_ISR(&statusMux);
   memcpy(&statusBuffer, incomingData, sizeof(ShowduinoStatus));
@@ -957,7 +1341,12 @@ void handle_status_queue() {
 
   if (hasUpdate) {
     latestStatus = pending;
+    if (pingPending) {
+      lastPingRoundtrip = millis() - lastPingSendMillis;
+      pingPending = false;
+    }
     update_live_controls(latestStatus);
+    update_diagnostics_panel(latestStatus);
     update_link_indicator();
   }
 }
@@ -965,6 +1354,31 @@ void handle_status_queue() {
 // ────────────────────────────────────────────────────────────────
 //  UTILS
 // ────────────────────────────────────────────────────────────────
+void init_backlight_pwm() {
+  ledcSetup(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RESOLUTION);
+  ledcAttachPin(TFT_BL, BACKLIGHT_PWM_CHANNEL);
+  apply_display_brightness(displayBrightness);
+}
+
+void apply_display_brightness(uint8_t level) {
+  displayBrightness = constrain(level, 0, 255);
+  uint32_t dutyMax = (1u << BACKLIGHT_PWM_RESOLUTION) - 1;
+  uint32_t duty = map(displayBrightness, 0, 255, 0, dutyMax);
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, duty);
+
+  if (settings_brightness_value) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u%%", (displayBrightness * 100) / 255);
+    lv_label_set_text(settings_brightness_value, buf);
+  }
+
+  if (settings_brightness_slider) {
+    updatingSettingsUi = true;
+    lv_slider_set_value(settings_brightness_slider, displayBrightness, LV_ANIM_OFF);
+    updatingSettingsUi = false;
+  }
+}
+
 void format_timecode(uint32_t ms, char *buffer, size_t len) {
   uint32_t totalSeconds = ms / 1000;
   uint32_t minutes = totalSeconds / 60;
@@ -1047,6 +1461,7 @@ void update_link_indicator() {
     lv_label_set_text(live_signal_label, LV_SYMBOL_WIFI " NO LINK");
     lv_obj_set_style_text_color(live_signal_label, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
     lv_label_set_text(live_peer_label, "Waiting for Brain...");
+    update_settings_telemetry();
     return;
   }
 
@@ -1069,6 +1484,138 @@ void update_link_indicator() {
            brainPeerMac[0], brainPeerMac[1], brainPeerMac[2],
            brainPeerMac[3], brainPeerMac[4], brainPeerMac[5]);
   lv_label_set_text(live_peer_label, macStr);
+  update_settings_telemetry();
+}
+
+void update_settings_telemetry() {
+  uint32_t now = millis();
+
+  if (settings_autopair_switch) {
+    updatingSettingsUi = true;
+    if (autoPairEnabled) {
+      lv_obj_add_state(settings_autopair_switch, LV_STATE_CHECKED);
+    } else {
+      lv_obj_clear_state(settings_autopair_switch, LV_STATE_CHECKED);
+    }
+    updatingSettingsUi = false;
+  }
+
+  if (settings_autopair_label) {
+    lv_label_set_text_fmt(settings_autopair_label, "Auto-Pair: %s",
+                          autoPairEnabled ? "Enabled (listen & lock)" : "Manual (hold paired Brain)");
+  }
+
+  if (settings_txpower_slider) {
+    updatingSettingsUi = true;
+    lv_slider_set_value(settings_txpower_slider, currentTxPower, LV_ANIM_OFF);
+    updatingSettingsUi = false;
+  }
+
+  if (settings_txpower_value) {
+    float dbm = currentTxPower / 4.0f;
+    lv_label_set_text_fmt(settings_txpower_value, "%d (%.1f dBm)", currentTxPower, dbm);
+  }
+
+  if (settings_channel_label) {
+    lv_label_set_text_fmt(settings_channel_label, "Channel: %u  • PHY: MCS7 (Short GI)",
+                          currentChannel);
+  }
+
+  if (settings_peer_label) {
+    if (brainPeerKnown) {
+      lv_label_set_text_fmt(settings_peer_label, "Paired Brain: %02X:%02X:%02X:%02X:%02X:%02X",
+                            brainPeerMac[0], brainPeerMac[1], brainPeerMac[2],
+                            brainPeerMac[3], brainPeerMac[4], brainPeerMac[5]);
+    } else {
+      lv_label_set_text(settings_peer_label, "Paired Brain: (none)");
+    }
+  }
+
+  if (settings_last_status_label) {
+    if (lastStatusMillis == 0) {
+      lv_label_set_text(settings_last_status_label, "Last Status: none received");
+    } else {
+      uint32_t age = now - lastStatusMillis;
+      lv_label_set_text_fmt(settings_last_status_label, "Last Status: %lu ms ago", static_cast<unsigned long>(age));
+    }
+  }
+
+  if (settings_ping_label) {
+    if (pingPending) {
+      uint32_t elapsed = now - lastPingSendMillis;
+      if (elapsed > 5000) {
+        pingPending = false;
+        lastPingRoundtrip = 0;
+        lv_label_set_text(settings_ping_label, "Ping: timeout (>5s)");
+      } else {
+        lv_label_set_text_fmt(settings_ping_label, "Ping: pending (%lu ms)", static_cast<unsigned long>(elapsed));
+      }
+    } else if (lastPingRoundtrip > 0) {
+      lv_label_set_text_fmt(settings_ping_label, "Ping: %lu ms round-trip", static_cast<unsigned long>(lastPingRoundtrip));
+    } else {
+      lv_label_set_text(settings_ping_label, "Ping: not run");
+    }
+  }
+}
+
+void update_diagnostics_panel(const ShowduinoStatus &status) {
+  if (!diag_mode_label) return;
+
+  if (lastStatusMillis == 0) {
+    lv_label_set_text(diag_mode_label, "--");
+    if (diag_relay_label) lv_label_set_text(diag_relay_label, "--");
+    if (diag_mp3_label) lv_label_set_text(diag_mp3_label, "--");
+    if (diag_led_label) lv_label_set_text(diag_led_label, "--");
+    if (diag_timeline_label) lv_label_set_text(diag_timeline_label, "--");
+    if (diag_last_update_label) lv_label_set_text(diag_last_update_label, "Last Status: none");
+    return;
+  }
+
+  const char *modeStr = status.mode == MODE_MANUAL ? "MANUAL (desk override)" : "AUTO (timeline)";
+  lv_label_set_text(diag_mode_label, modeStr);
+
+  if (diag_relay_label) {
+    char buf[64];
+    char *ptr = buf;
+    for (size_t i = 0; i < 8; ++i) {
+      ptr += snprintf(ptr, sizeof(buf) - (ptr - buf), "%u%s", status.relays[i],
+                      (i < 7) ? " " : "");
+    }
+    lv_label_set_text(diag_relay_label, buf);
+  }
+
+  if (diag_mp3_label) {
+    char buf[80];
+    const char *stateA = status.mp3State[0] ? "PLAY" : "STOP";
+    const char *stateB = status.mp3State[1] ? "PLAY" : "STOP";
+    snprintf(buf, sizeof(buf), "A:%u/%s  B:%u/%s",
+             status.mp3Vol[0], stateA, status.mp3Vol[1], stateB);
+    lv_label_set_text(diag_mp3_label, buf);
+  }
+
+  if (diag_led_label) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%u  %u  %u  %u",
+             status.ledBrightness[0], status.ledBrightness[1],
+             status.ledBrightness[2], status.ledBrightness[3]);
+    lv_label_set_text(diag_led_label, buf);
+  }
+
+  if (diag_timeline_label) {
+    char timecode[16];
+    format_timecode(status.timelinePos, timecode, sizeof(timecode));
+    lv_label_set_text_fmt(diag_timeline_label, "Cue %u @ %s", status.activeCue, timecode);
+  }
+
+  if (diag_last_update_label) {
+    if (lastStatusMillis == 0) {
+      lv_label_set_text(diag_last_update_label, "Last Status: none");
+    } else {
+      uint32_t age = millis() - lastStatusMillis;
+      lv_label_set_text_fmt(diag_last_update_label, "Last Status: %lu ms ago",
+                            static_cast<unsigned long>(age));
+    }
+  }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1178,6 +1725,60 @@ void pair_button_event_cb(lv_event_t *e) {
   update_link_indicator();
 }
 
+void settings_brightness_event_cb(lv_event_t *e) {
+  if (updatingSettingsUi) return;
+  uint16_t level = lv_slider_get_value(lv_event_get_target(e));
+  apply_display_brightness(level);
+}
+
+void settings_autopair_event_cb(lv_event_t *e) {
+  bool enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  autoPairEnabled = enabled;
+  Serial.printf("[ESP-NOW] Auto-pair %s\n", enabled ? "ENABLED" : "DISABLED");
+  update_settings_telemetry();
+}
+
+void settings_txpower_event_cb(lv_event_t *e) {
+  int raw = lv_slider_get_value(lv_event_get_target(e));
+  int quantized = (raw / 4) * 4;
+  if (quantized < 8) quantized = 8;
+  if (quantized > SHOWDUINO_MAX_TX_POWER) quantized = SHOWDUINO_MAX_TX_POWER;
+  currentTxPower = quantized;
+  updatingSettingsUi = true;
+  lv_slider_set_value(lv_event_get_target(e), currentTxPower, LV_ANIM_OFF);
+  updatingSettingsUi = false;
+  if (espNowReady) {
+    esp_wifi_set_max_tx_power(currentTxPower);
+  }
+  update_settings_telemetry();
+}
+
+void settings_ping_event_cb(lv_event_t *e) {
+  (void)e;
+  ShowduinoCommand cmd{};
+  cmd.type = CMD_PING;
+  if (send_showduino_command(cmd)) {
+    pingPending = true;
+    lastPingSendMillis = millis();
+    lastPingRoundtrip = 0;
+  }
+  update_settings_telemetry();
+}
+
+void settings_back_event_cb(lv_event_t *e) {
+  (void)e;
+  if (screen_main) {
+    lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+  }
+}
+
+void diagnostics_back_event_cb(lv_event_t *e) {
+  (void)e;
+  if (screen_main) {
+    lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+  }
+}
+
 // ────────────────────────────────────────────────────────────────
 //  SETUP
 // ────────────────────────────────────────────────────────────────
@@ -1194,7 +1795,7 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
+  init_backlight_pwm();
 
   Serial.println("[BOOT] Initialising RGB panel...");
   rgbpanel = new Arduino_ESP32RGBPanel(
