@@ -469,7 +469,9 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
 }
 
 bool init_storage() {
+  yield();
   if (storageBackend == STORAGE_SD && sdMounted) {
+    yield();
     return true;
   }
 
@@ -478,21 +480,24 @@ bool init_storage() {
 #else
   SPI.begin();
 #endif
+  yield();
 
   if (SD.begin(SD_CS_PIN)) {
     storageBackend = STORAGE_SD;
     sdMounted = true;
     storageReady = true;
     Serial.println("[STORAGE] SD card mounted as primary storage");
-      ensure_show_library_dir();
-      const char *registryPath = "/builder/registry.txt";
-      if (!SD.exists(registryPath)) {
-        File regFile = SD.open(registryPath, FILE_WRITE);
-        if (regFile) {
-          regFile.println("# Show Registry");
-          regFile.close();
-        }
+    ensure_show_library_dir();
+    const char *registryPath = "/builder/registry.txt";
+    if (!SD.exists(registryPath)) {
+      File regFile = SD.open(registryPath, FILE_WRITE);
+      if (regFile) {
+        regFile.println("# Show Registry");
+        regFile.close();
       }
+      yield();
+    }
+    yield();
     return true;
   }
 
@@ -500,16 +505,20 @@ bool init_storage() {
   sdMounted = false;
   storageReady = false;
   Serial.println("[STORAGE] ⚠️ SD card not detected – using transient memory only");
+  yield();
   return false;
 }
 
 bool ensure_show_library_dir() {
+  yield();
   if (storageBackend != STORAGE_SD || !sdMounted) return false;
   if (!SD.exists(SHOW_LIBRARY_DIR)) {
     SD.mkdir(SHOW_LIBRARY_DIR);
+    yield();
   }
   if (!SD.exists(BUILDER_EXPORT_DIR)) {
     SD.mkdir(BUILDER_EXPORT_DIR);
+    yield();
   }
   return true;
 }
@@ -530,12 +539,14 @@ static void sanitise_show_name(const char *source, char *dest, size_t destLen) {
 
 bool load_show_library_from_storage() {
   builderShowCount = 0;
+  yield();
 
   if (init_storage() && storageBackend == STORAGE_SD && sdMounted) {
     ensure_show_library_dir();
     File dir = SD.open(SHOW_LIBRARY_DIR);
     if (dir) {
       while (true) {
+        yield();
         File entry = dir.openNextFile();
         if (!entry) break;
         if (!entry.isDirectory() && builderShowCount < MAX_SHOW_LIBRARY_ENTRIES) {
@@ -548,6 +559,7 @@ bool load_show_library_from_storage() {
             ShowEntry &slot = builderShowEntries[builderShowCount++];
             memset(&slot, 0, sizeof(slot));
             strncpy(slot.name, cleaned, sizeof(slot.name) - 1);
+            yield();
           }
         }
         entry.close();
@@ -560,6 +572,7 @@ bool load_show_library_from_storage() {
     ShowEntry &slot = builderShowEntries[builderShowCount++];
     memset(&slot, 0, sizeof(slot));
     strncpy(slot.name, "Demo FX Cue", sizeof(slot.name) - 1);
+    yield();
   }
 
   return builderShowCount > 0;
@@ -569,6 +582,7 @@ bool save_builder_to_storage(const char *name) {
   if (!name || !*name) return false;
   if (!init_storage() || storageBackend != STORAGE_SD || !sdMounted) return false;
   ensure_show_library_dir();
+  yield();
 
   char safeName[64];
   sanitise_show_name(name, safeName, sizeof(safeName));
@@ -582,6 +596,7 @@ bool save_builder_to_storage(const char *name) {
     Serial.printf("[STORAGE] ❌ Failed to open %s for writing\n", path.c_str());
     return false;
   }
+  yield();
 
   file.print("{\"clips\":[");
   for (size_t i = 0; i < builderClipCount; ++i) {
@@ -592,6 +607,7 @@ bool save_builder_to_storage(const char *name) {
                 static_cast<unsigned long>(clip.startMs),
                 static_cast<unsigned long>(builderTimelineMs / 16));
     if (i + 1 < builderClipCount) file.print(",");
+    yield();
   }
   file.print("]}");
   file.close();
@@ -600,6 +616,7 @@ bool save_builder_to_storage(const char *name) {
   if (registry) {
     registry.printf("%s.show\n", safeName);
     registry.close();
+    yield();
   }
   Serial.printf("[STORAGE] ✓ Builder arrangement saved to %s\n", path.c_str());
   return true;
@@ -1281,12 +1298,14 @@ void builder_reset_show_item(ShowEntry *entry) {
 
 void builder_clear_workspace() {
   for (size_t i = 0; i < builderClipCount; ++i) {
+    yield();
     if (builderClips[i].widget) {
       lv_obj_del(builderClips[i].widget);
       builderClips[i].widget = nullptr;
     }
   }
   builderClipCount = 0;
+  yield();
 }
 
 static bool builder_rect_overlap(const lv_area_t &a, const lv_area_t &b) {
@@ -1306,6 +1325,7 @@ void builder_add_clip(const char *name, uint32_t startMs, uint8_t lane) {
     show_toast("Clip limit reached – delete a clip to add more", 2500);
     return;
   }
+  yield();
 
   BuilderClip &clip = builderClips[builderClipCount++];
   memset(&clip, 0, sizeof(clip));
@@ -1331,6 +1351,7 @@ void builder_add_clip(const char *name, uint32_t startMs, uint8_t lane) {
   lv_coord_t x = (lv_coord_t)((clip.startMs / (float)builderTimelineMs) * innerWidth);
   lv_coord_t y = clip.lane * BUILDER_LANE_HEIGHT + 10;
   lv_obj_set_pos(widget, x + 10, y);
+  yield();
 
   if (builder_status_label) {
     char msg[96];
@@ -1347,6 +1368,7 @@ void refresh_show_library() {
   lv_obj_clean(builder_show_list);
   for (size_t i = 0; i < builderShowCount; ++i) {
     builderShowEntries[i].widget = nullptr;
+    yield();
   }
 
   load_show_library_from_storage();
@@ -1354,6 +1376,7 @@ void refresh_show_library() {
   for (size_t i = 0; i < builderShowCount; ++i) {
     ShowEntry &entry = builderShowEntries[i];
     builder_attach_library_button(entry);
+    yield();
   }
 
   if (builder_status_label) {
@@ -1382,12 +1405,14 @@ void builder_show_item_event_cb(lv_event_t *e) {
     lv_obj_move_foreground(entry->widget);
     lv_obj_set_size(entry->widget, BUILDER_CLIP_WIDTH, BUILDER_CLIP_HEIGHT);
     entry->floating = true;
+    yield();
   } else if (code == LV_EVENT_PRESSING && indev && entry->floating) {
     lv_point_t point;
     lv_indev_get_point(indev, &point);
     lv_coord_t newX = point.x - entry->dragOffsetX;
     lv_coord_t newY = point.y - entry->dragOffsetY;
     lv_obj_set_pos(entry->widget, newX, newY);
+    yield();
   } else if ((code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST || code == LV_EVENT_DRAG_END) && entry->floating) {
     bool dropped = false;
     if (builder_timeline_area) {
@@ -1419,6 +1444,7 @@ void builder_show_item_event_cb(lv_event_t *e) {
       }
       show_toast("Cue returned to library");
     }
+    yield();
   }
 }
 
@@ -1479,17 +1505,20 @@ void builder_save_event_cb(lv_event_t *e) {
 // ────────────────────────────────────────────────────────────────
 void create_settings_screen() {
   Serial.println("[UI] Creating settings screen...");
+  yield();
 
   screen_settings = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(screen_settings, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
   lv_obj_set_style_pad_all(screen_settings, 16, LV_PART_MAIN);
   lv_obj_set_scrollbar_mode(screen_settings, LV_SCROLLBAR_MODE_AUTO);
+  yield();
 
   lv_obj_t *header = lv_label_create(screen_settings);
   lv_label_set_text(header, LV_SYMBOL_SETTINGS " SETTINGS & LINK");
   lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
   lv_obj_set_style_text_font(header, &lv_font_montserrat_26, LV_PART_MAIN);
   lv_obj_align(header, LV_ALIGN_TOP_LEFT, 10, 10);
+  yield();
 
   lv_obj_t *btn_back = lv_btn_create(screen_settings);
   lv_obj_set_size(btn_back, 110, 48);
@@ -1861,6 +1890,7 @@ void create_builder_screen() {
   lv_obj_set_style_pad_all(builder_timeline_area, 10, LV_PART_MAIN);
 
   for (uint8_t lane = 0; lane < BUILDER_LANE_COUNT; ++lane) {
+    yield();
     lv_obj_t *lane_line = lv_obj_create(builder_timeline_area);
     lv_obj_set_size(lane_line, LV_PCT(100), 2);
     lv_obj_set_style_bg_color(lane_line, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
@@ -1875,6 +1905,7 @@ void create_builder_screen() {
     lv_obj_set_style_text_font(lane_label, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(lane_label, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
     lv_obj_align(lane_label, LV_ALIGN_TOP_LEFT, 4, lane * BUILDER_LANE_HEIGHT + 6);
+    yield();
   }
 
   builder_status_label = lv_label_create(screen_builder);
