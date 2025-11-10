@@ -156,6 +156,18 @@ static const BrainAddonDef brainAddonDefs[] = {
 static constexpr size_t brainAddonCount = sizeof(brainAddonDefs) / sizeof(BrainAddonDef);
 static bool brainAddonAvailable[brainAddonCount] = {false};
 
+static constexpr uint8_t MAX_PIXEL_GROUPS = 8;
+struct PixelGroupState {
+  bool active;
+  uint8_t start;
+  uint8_t length;
+  uint8_t effect;
+  uint8_t brightness;
+};
+
+static PixelGroupState pixelGroups[MAX_PIXEL_GROUPS] = {};
+static uint32_t lastPixelFrameMs = 0;
+
 // ────────────────────────────────────────────────
 //  Helper Functions
 // ────────────────────────────────────────────────
@@ -184,6 +196,107 @@ const BrainAddonDef* findBrainAddon(uint8_t addonId, size_t *indexOut = nullptr)
     }
   }
   return nullptr;
+}
+
+PixelGroupState *getPixelGroup(uint8_t start, uint8_t length, size_t *indexOut = nullptr) {
+  if (length == 0) length = 1;
+  PixelGroupState *inactiveSlot = nullptr;
+  size_t inactiveIndex = MAX_PIXEL_GROUPS;
+  for (size_t i = 0; i < MAX_PIXEL_GROUPS; ++i) {
+    PixelGroupState &group = pixelGroups[i];
+    if (group.active && group.start == start && group.length == length) {
+      if (indexOut) *indexOut = i;
+      return &group;
+    }
+    if (group.active && group.start == start) {
+      group.length = length;
+      if (indexOut) *indexOut = i;
+      return &group;
+    }
+    if (!group.active && !inactiveSlot) {
+      inactiveSlot = &group;
+      inactiveIndex = i;
+    }
+  }
+  if (!inactiveSlot) {
+    inactiveSlot = &pixelGroups[MAX_PIXEL_GROUPS - 1];
+    inactiveIndex = MAX_PIXEL_GROUPS - 1;
+  }
+  inactiveSlot->active = true;
+  inactiveSlot->start = start;
+  inactiveSlot->length = length;
+  inactiveSlot->effect = 0;
+  inactiveSlot->brightness = inactiveSlot->brightness == 0 ? 180 : inactiveSlot->brightness;
+  if (indexOut) *indexOut = inactiveIndex;
+  return inactiveSlot;
+}
+
+static inline uint8_t scaleBrightness(uint8_t base, uint8_t factor) {
+  return (uint16_t)base * factor / 255;
+}
+
+uint32_t computeEffectColor(const PixelGroupState &group, uint8_t offset, uint32_t nowMs) {
+  uint8_t level = group.brightness;
+  switch (group.effect) {
+    case 0: // Solid
+      return pixels.Color(level, 0, 0);
+    case 1: { // Pulse
+      uint8_t phase = ((nowMs / 10) + offset * 8) & 0xFF;
+      uint8_t triangle = phase < 128 ? phase * 2 : (255 - phase) * 2;
+      uint8_t scaled = scaleBrightness(level, triangle);
+      return pixels.Color(0, scaled, scaled);
+    }
+    case 2: { // Fade
+      uint8_t phase = ((nowMs / 12) + offset * 4) & 0xFF;
+      uint8_t scaled = scaleBrightness(level, phase);
+      uint8_t tail = scaleBrightness(level, 255 - phase);
+      return pixels.Color(scaled, tail, 0);
+    }
+    case 3: { // Glitch
+      uint8_t noise = ((nowMs / 5) + offset * 37) & 0xFF;
+      uint8_t burst = (noise & 0xE0) ? level : level / 6;
+      return pixels.Color(burst, 0, scaleBrightness(level, 64));
+    }
+    case 4: { // Chase
+      uint16_t chase = ((nowMs / 30) + offset * 12) % 255;
+      bool on = chase < 128;
+      uint8_t head = on ? level : level / 12;
+      uint8_t tail = on ? scaleBrightness(level, 64) : scaleBrightness(level, 8);
+      return pixels.Color(head, tail, on ? level : 0);
+    }
+    default:
+      return pixels.Color(level, level, level);
+  }
+}
+
+void renderPixelGroups(bool force = false) {
+  uint32_t now = millis();
+  if (!force && (now - lastPixelFrameMs) < 33) {
+    return;
+  }
+  lastPixelFrameMs = now;
+  pixels.clear();
+  for (uint8_t i = 0; i < 4; ++i) {
+    status.ledBrightness[i] = 0;
+  }
+  for (size_t i = 0; i < MAX_PIXEL_GROUPS; ++i) {
+    PixelGroupState &group = pixelGroups[i];
+    if (!group.active) continue;
+    if (group.start >= LED_PIXEL_COUNT) continue;
+    if (group.length == 0) group.length = 1;
+    uint16_t cappedLength = group.length;
+    if (group.start + cappedLength > LED_PIXEL_COUNT) {
+      cappedLength = LED_PIXEL_COUNT - group.start;
+    }
+    status.ledBrightness[i % 4] = group.brightness;
+    for (uint16_t offset = 0; offset < cappedLength; ++offset) {
+      uint32_t color = computeEffectColor(group, offset, now);
+      pixels.setPixelColor(group.start + offset, color);
+    }
+    yield();
+  }
+  pixels.show();
+  yield();
 }
 
 bool brainAddonIsAvailable(uint8_t addonId) {
@@ -248,23 +361,29 @@ void handleSmokeAction(uint8_t action, uint16_t param) {
   }
 }
 
-void handlePixelAction(uint8_t action, uint16_t param) {
-  if (action == ADDON_PIXELS_BRIGHTNESS) {
-    uint8_t brightness = constrain(param, 0u, 255u);
-    pixels.setBrightness(brightness);
-    pixels.show();
-    status.ledBrightness[0] = brightness;
-  } else if (action == ADDON_PIXELS_EFFECT) {
-    // Placeholder: solid colors per effect
-    switch (param) {
-      case 0: pixels.fill(pixels.Color(255, 0, 0)); break;
-      case 1: pixels.fill(pixels.Color(0, 0, 255)); break;
-      case 2: pixels.fill(pixels.Color(0, 255, 0)); break;
-      case 3: pixels.fill(pixels.Color(255, 255, 0)); break;
-      default: pixels.fill(pixels.Color(32, 32, 32)); break;
-    }
-    pixels.show();
+void handlePixelAction(uint8_t action, uint16_t param, uint16_t aux) {
+  uint8_t start = aux & 0x00FF;
+  uint8_t length = (aux >> 8) & 0x00FF;
+  if (length == 0) length = LED_PIXEL_COUNT;
+  if (start >= LED_PIXEL_COUNT) start = LED_PIXEL_COUNT - 1;
+  if (length > (LED_PIXEL_COUNT - start)) {
+    length = LED_PIXEL_COUNT - start;
   }
+
+  size_t groupIndex = 0;
+  PixelGroupState *group = getPixelGroup(start, length, &groupIndex);
+  if (!group) return;
+
+  if (action == ADDON_PIXELS_BRIGHTNESS) {
+    group->brightness = constrain(param, 0u, 255u);
+  } else if (action == ADDON_PIXELS_EFFECT) {
+    group->effect = param;
+    if (group->brightness == 0) {
+      group->brightness = 255;
+    }
+  }
+  renderPixelGroups(true);
+  yield();
 }
 
 void handleRelayExpanderAction(uint8_t action) {
@@ -312,7 +431,7 @@ void handleAddonCommand(uint8_t addonId, uint32_t packedAction, uint16_t value) 
   }
   switch (addonId) {
     case 10: handleSmokeAction(action, value); break;
-    case 11: handlePixelAction(action, value); break;
+    case 11: handlePixelAction(action, value, aux); break;
     case 12: handleRelayExpanderAction(action); break;
     case 13: handleMp3AddonAction(action, value); break;
     case 14: handleR3AddonAction(value); break;
@@ -354,7 +473,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
     case CMD_LED:
       status.ledBrightness[cmd.id % 4] = cmd.value;
       pixels.setBrightness(cmd.value);
-      pixels.show();
+      renderPixelGroups(true);
       break;
     case CMD_MP3_PLAY:
       status.mp3State[cmd.id & 0x01] = 1;
@@ -477,6 +596,7 @@ void setup() {
   pixels.begin();
   pixels.clear();
   pixels.show();
+  renderPixelGroups(true);
 
   initRTC();
   initESPNow();
@@ -489,6 +609,7 @@ void setup() {
 
 void loop() {
   sampleTemperature();
+  renderPixelGroups(false);
   loopStatus();
   delay(5);
 }
