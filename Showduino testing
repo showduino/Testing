@@ -91,7 +91,8 @@ static constexpr const char *SHOW_LIBRARY_DIR = "/shows";
 static constexpr const char *BUILDER_EXPORT_DIR = "/builder";
 static constexpr const char *MP3_SD_MOUNT_CMD = "mp3_scan";
 static constexpr uint8_t BOOT_STAGE_TOTAL = 7;
-static constexpr uint16_t ADDON_PIXEL_COUNT = 60;
+static constexpr uint8_t ADDON_PIXEL_LINES = 4;
+static constexpr uint16_t ADDON_PIXELS_PER_LINE = 120;
 
 // ────────────────────────────────────────────────────────────────
 //  ESP-NOW LINK CONFIG
@@ -303,6 +304,7 @@ struct AddonControlRefs {
   lv_obj_t *dropdown = nullptr;
   lv_obj_t *toggleButtons[16] = {nullptr};
   lv_obj_t *statusLabel = nullptr;
+  lv_obj_t *lineDropdown = nullptr;
   lv_obj_t *groupDropdown = nullptr;
   lv_obj_t *spinStart = nullptr;
   lv_obj_t *spinLength = nullptr;
@@ -314,6 +316,7 @@ struct AddonCardContext {
   lv_obj_t *card = nullptr;
   AddonControlRefs controls;
   bool updating = false;
+  uint8_t currentLine = 0;
 };
 
 struct AddonEventPayload {
@@ -463,6 +466,8 @@ bool save_builder_to_storage(const char *name);
 void addon_slider_event_cb(lv_event_t *e);
 void addon_button_event_cb(lv_event_t *e);
 void addon_dropdown_event_cb(lv_event_t *e);
+void addon_line_dropdown_event_cb(lv_event_t *e);
+void addon_group_dropdown_event_cb(lv_event_t *e);
 void scan_i2c_bus();
 bool addon_is_available(const AddonDefinition *def);
 void update_addon_availability();
@@ -1662,14 +1667,26 @@ void addon_slider_event_cb(lv_event_t *e) {
   yield();
   if (payload->action == ADDON_PIXELS_BRIGHTNESS) {
     uint16_t startPix = 0;
-    uint16_t lengthPix = ADDON_PIXEL_COUNT;
+    uint16_t lengthPix = ADDON_PIXELS_PER_LINE;
     if (payload->ctx->controls.spinStart && payload->ctx->controls.spinLength) {
       startPix = lv_spinbox_get_value(payload->ctx->controls.spinStart);
       lengthPix = lv_spinbox_get_value(payload->ctx->controls.spinLength);
     }
-    startPix = constrain(startPix, (uint16_t)0, (uint16_t)255);
-    lengthPix = constrain(lengthPix, (uint16_t)1, (uint16_t)255);
-    uint16_t packed = ((lengthPix & 0x00FF) << 8) | (startPix & 0x00FF);
+    startPix = constrain(startPix, (uint16_t)0, (uint16_t)(ADDON_PIXELS_PER_LINE - 1));
+    lengthPix = constrain(lengthPix, (uint16_t)1, (uint16_t)ADDON_PIXELS_PER_LINE);
+    uint8_t line = payload->ctx->currentLine;
+    if (payload->ctx->controls.lineDropdown) {
+      line = lv_dropdown_get_selected(payload->ctx->controls.lineDropdown);
+      payload->ctx->currentLine = line;
+    }
+    if (ADDON_PIXEL_LINES > 0) {
+      line = line % ADDON_PIXEL_LINES;
+    } else {
+      line = 0;
+    }
+    uint16_t packed = ((line & 0x03) << 14) |
+                      ((startPix & 0x7F) << 7) |
+                      (lengthPix & 0x7F);
     send_addon_action(payload->ctx->addonId, payload->action, value, packed);
   } else {
     send_addon_action(payload->ctx->addonId, payload->action, value, payload->aux);
@@ -1694,35 +1711,66 @@ void addon_dropdown_event_cb(lv_event_t *e) {
   if (!payload || !payload->ctx) return;
   lv_obj_t *dd = lv_event_get_target(e);
   uint16_t selected = lv_dropdown_get_selected(dd);
-  if (payload->ctx->controls.groupDropdown == dd && selected != 3) {
-    if (payload->ctx->controls.spinStart && payload->ctx->controls.spinLength) {
-      if (selected == 0) {
-        lv_spinbox_set_value(payload->ctx->controls.spinStart, 0);
-        lv_spinbox_set_value(payload->ctx->controls.spinLength, ADDON_PIXEL_COUNT);
-      } else if (selected == 1) {
-        lv_spinbox_set_value(payload->ctx->controls.spinStart, 0);
-        lv_spinbox_set_value(payload->ctx->controls.spinLength, ADDON_PIXEL_COUNT / 2);
-      } else if (selected == 2) {
-        lv_spinbox_set_value(payload->ctx->controls.spinStart, ADDON_PIXEL_COUNT / 2);
-        lv_spinbox_set_value(payload->ctx->controls.spinLength, ADDON_PIXEL_COUNT / 2);
-      }
-    }
-  }
   yield();
   if (payload->action == ADDON_PIXELS_EFFECT) {
     uint16_t startPix = 0;
-    uint16_t lengthPix = ADDON_PIXEL_COUNT;
+    uint16_t lengthPix = ADDON_PIXELS_PER_LINE;
     if (payload->ctx->controls.spinStart && payload->ctx->controls.spinLength) {
       startPix = lv_spinbox_get_value(payload->ctx->controls.spinStart);
       lengthPix = lv_spinbox_get_value(payload->ctx->controls.spinLength);
     }
-    startPix = constrain(startPix, (uint16_t)0, (uint16_t)255);
-    lengthPix = constrain(lengthPix, (uint16_t)1, (uint16_t)255);
-    uint16_t packed = ((lengthPix & 0x00FF) << 8) | (startPix & 0x00FF);
+    startPix = constrain(startPix, (uint16_t)0, (uint16_t)(ADDON_PIXELS_PER_LINE - 1));
+    lengthPix = constrain(lengthPix, (uint16_t)1, (uint16_t)ADDON_PIXELS_PER_LINE);
+    uint8_t line = payload->ctx->currentLine;
+    if (payload->ctx->controls.lineDropdown) {
+      line = lv_dropdown_get_selected(payload->ctx->controls.lineDropdown);
+      payload->ctx->currentLine = line;
+    }
+    if (ADDON_PIXEL_LINES > 0) {
+      line = line % ADDON_PIXEL_LINES;
+    } else {
+      line = 0;
+    }
+    uint16_t packed = ((line & 0x03) << 14) |
+                      ((startPix & 0x7F) << 7) |
+                      (lengthPix & 0x7F);
     send_addon_action(payload->ctx->addonId, payload->action, selected, packed);
   } else {
     send_addon_action(payload->ctx->addonId, payload->action, selected, payload->aux);
   }
+}
+
+void addon_line_dropdown_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  auto *ctx = static_cast<AddonCardContext *>(lv_event_get_user_data(e));
+  if (!ctx) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (ADDON_PIXEL_LINES > 0) {
+    ctx->currentLine = selected % ADDON_PIXEL_LINES;
+  } else {
+    ctx->currentLine = 0;
+  }
+  yield();
+  addon_refresh_pixels(ctx, latestStatus);
+}
+
+void addon_group_dropdown_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  auto *ctx = static_cast<AddonCardContext *>(lv_event_get_user_data(e));
+  if (!ctx) return;
+  if (!ctx->controls.spinStart || !ctx->controls.spinLength) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (selected == 0) {
+    lv_spinbox_set_value(ctx->controls.spinStart, 0);
+    lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXELS_PER_LINE);
+  } else if (selected == 1) {
+    lv_spinbox_set_value(ctx->controls.spinStart, 0);
+    lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXELS_PER_LINE / 2);
+  } else if (selected == 2) {
+    lv_spinbox_set_value(ctx->controls.spinStart, ADDON_PIXELS_PER_LINE / 2);
+    lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXELS_PER_LINE / 2);
+  }
+  yield();
 }
 
 static void addon_create_header(AddonCardContext *ctx) {
@@ -1775,14 +1823,29 @@ static void addon_build_smoke(AddonCardContext *ctx) {
 
 static void addon_build_pixels(AddonCardContext *ctx) {
   addon_create_header(ctx);
+  ctx->currentLine = 0;
+
+  lv_obj_t *lineLabel = lv_label_create(ctx->card);
+  lv_label_set_text(lineLabel, "Line");
+  lv_obj_set_style_text_color(lineLabel, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  yield();
+
+  lv_obj_t *lineDrop = lv_dropdown_create(ctx->card);
+  lv_dropdown_set_options(lineDrop, "Line 1\nLine 2\nLine 3\nLine 4");
+  lv_dropdown_set_selected(lineDrop, 0);
+  ctx->controls.lineDropdown = lineDrop;
+  lv_obj_add_event_cb(lineDrop, addon_line_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, ctx);
+  yield();
+
   lv_obj_t *groupLabel = lv_label_create(ctx->card);
   lv_label_set_text(groupLabel, "Group");
   lv_obj_set_style_text_color(groupLabel, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
   yield();
 
   lv_obj_t *groupDrop = lv_dropdown_create(ctx->card);
-  lv_dropdown_set_options(groupDrop, "Full Strip\nPixels 0-29\nPixels 30-59\nCustom");
+  lv_dropdown_set_options(groupDrop, "Full Line\nPixels 0-59\nPixels 60-119\nCustom");
   ctx->controls.groupDropdown = groupDrop;
+  lv_obj_add_event_cb(groupDrop, addon_group_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, ctx);
   yield();
 
   lv_obj_t *slider = lv_slider_create(ctx->card);
@@ -1794,7 +1857,7 @@ static void addon_build_pixels(AddonCardContext *ctx) {
   yield();
 
   lv_obj_t *effect = lv_dropdown_create(ctx->card);
-  lv_dropdown_set_options(effect, "Solid\nPulse\nFade\nGlitch\nChase");
+  lv_dropdown_set_options(effect, "Solid\nFlash\nChase\nTwinkle\nGradient\nWave");
   ctx->controls.dropdown = effect;
   if (auto payload = addon_make_payload(ctx, ADDON_PIXELS_EFFECT)) {
     lv_obj_add_event_cb(effect, addon_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, payload);
@@ -1807,14 +1870,14 @@ static void addon_build_pixels(AddonCardContext *ctx) {
   lv_obj_set_style_pad_all(rangeContainer, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_column(rangeContainer, 8, LV_PART_MAIN);
   ctx->controls.spinStart = lv_spinbox_create(rangeContainer);
-  lv_spinbox_set_range(ctx->controls.spinStart, 0, 255);
+  lv_spinbox_set_range(ctx->controls.spinStart, 0, ADDON_PIXELS_PER_LINE - 1);
   lv_spinbox_set_step(ctx->controls.spinStart, 1);
   lv_spinbox_set_value(ctx->controls.spinStart, 0);
 
   ctx->controls.spinLength = lv_spinbox_create(rangeContainer);
-  lv_spinbox_set_range(ctx->controls.spinLength, 1, 255);
+  lv_spinbox_set_range(ctx->controls.spinLength, 1, ADDON_PIXELS_PER_LINE);
   lv_spinbox_set_step(ctx->controls.spinLength, 1);
-  lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXEL_COUNT);
+  lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXELS_PER_LINE);
   yield();
 
   ctx->controls.statusLabel = lv_label_create(ctx->card);
@@ -1909,7 +1972,17 @@ static void addon_build_r3(AddonCardContext *ctx) {
 static void addon_refresh_pixels(AddonCardContext *ctx, const ShowduinoStatus &status) {
   if (!ctx || !ctx->controls.sliderPrimary) return;
   ctx->updating = true;
-  uint16_t value = status.ledBrightness[0];
+  uint8_t line = ctx->currentLine;
+  if (ctx->controls.lineDropdown) {
+    line = lv_dropdown_get_selected(ctx->controls.lineDropdown);
+    ctx->currentLine = line;
+  }
+  if (ADDON_PIXEL_LINES > 0) {
+    line = line % ADDON_PIXEL_LINES;
+  } else {
+    line = 0;
+  }
+  uint16_t value = status.ledBrightness[line];
   if (value > 255) value = 255;
   lv_slider_set_value(ctx->controls.sliderPrimary, value, LV_ANIM_OFF);
   if (ctx->controls.statusLabel) {

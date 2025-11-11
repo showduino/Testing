@@ -18,6 +18,7 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <DHT.h>
+#include <math.h>
 
 // Optional peripheral libraries
 #include <Adafruit_NeoPixel.h>
@@ -28,8 +29,9 @@
 #define RELAY_COUNT           8
 static const uint8_t RELAY_PINS[RELAY_COUNT] = {4, 5, 6, 7, 8, 9, 10, 11};
 
-#define LED_PIXEL_PIN         18
-#define LED_PIXEL_COUNT       60
+static constexpr uint8_t LED_LINE_COUNT = 4;
+static const uint8_t LED_PIXEL_PINS[LED_LINE_COUNT] = {38, 39, 40, 41};
+static constexpr uint16_t LED_PIXELS_PER_LINE = 120;
 
 #define SMOKE_RELAY_PIN       12
 #define FAN_PWM_PIN           14
@@ -133,7 +135,12 @@ static RTC_DS3231 rtc;
 static bool rtcReady = false;
 
 static DHT dht(DHT_PIN, DHT_TYPE);
-static Adafruit_NeoPixel pixels(LED_PIXEL_COUNT, LED_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
+static Adafruit_NeoPixel pixelLines[LED_LINE_COUNT] = {
+  Adafruit_NeoPixel(LED_PIXELS_PER_LINE, LED_PIXEL_PINS[0], NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(LED_PIXELS_PER_LINE, LED_PIXEL_PINS[1], NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(LED_PIXELS_PER_LINE, LED_PIXEL_PINS[2], NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(LED_PIXELS_PER_LINE, LED_PIXEL_PINS[3], NEO_GRB + NEO_KHZ800),
+};
 
 static uint8_t uiPeer[6] = {0};
 static bool peerKnown = false;
@@ -159,6 +166,7 @@ static bool brainAddonAvailable[brainAddonCount] = {false};
 static constexpr uint8_t MAX_PIXEL_GROUPS = 8;
 struct PixelGroupState {
   bool active;
+  uint8_t line;
   uint8_t start;
   uint8_t length;
   uint8_t effect;
@@ -198,17 +206,17 @@ const BrainAddonDef* findBrainAddon(uint8_t addonId, size_t *indexOut = nullptr)
   return nullptr;
 }
 
-PixelGroupState *getPixelGroup(uint8_t start, uint8_t length, size_t *indexOut = nullptr) {
+PixelGroupState *getPixelGroup(uint8_t line, uint8_t start, uint8_t length, size_t *indexOut = nullptr) {
   if (length == 0) length = 1;
   PixelGroupState *inactiveSlot = nullptr;
   size_t inactiveIndex = MAX_PIXEL_GROUPS;
   for (size_t i = 0; i < MAX_PIXEL_GROUPS; ++i) {
     PixelGroupState &group = pixelGroups[i];
-    if (group.active && group.start == start && group.length == length) {
+    if (group.active && group.line == line && group.start == start && group.length == length) {
       if (indexOut) *indexOut = i;
       return &group;
     }
-    if (group.active && group.start == start) {
+    if (group.active && group.line == line && group.start == start) {
       group.length = length;
       if (indexOut) *indexOut = i;
       return &group;
@@ -223,6 +231,7 @@ PixelGroupState *getPixelGroup(uint8_t start, uint8_t length, size_t *indexOut =
     inactiveIndex = MAX_PIXEL_GROUPS - 1;
   }
   inactiveSlot->active = true;
+  inactiveSlot->line = line % LED_LINE_COUNT;
   inactiveSlot->start = start;
   inactiveSlot->length = length;
   inactiveSlot->effect = 0;
@@ -237,35 +246,45 @@ static inline uint8_t scaleBrightness(uint8_t base, uint8_t factor) {
 
 uint32_t computeEffectColor(const PixelGroupState &group, uint8_t offset, uint32_t nowMs) {
   uint8_t level = group.brightness;
+  const Adafruit_NeoPixel &strip = pixelLines[group.line % LED_LINE_COUNT];
   switch (group.effect) {
     case 0: // Solid
-      return pixels.Color(level, 0, 0);
-    case 1: { // Pulse
-      uint8_t phase = ((nowMs / 10) + offset * 8) & 0xFF;
-      uint8_t triangle = phase < 128 ? phase * 2 : (255 - phase) * 2;
-      uint8_t scaled = scaleBrightness(level, triangle);
-      return pixels.Color(0, scaled, scaled);
+      return strip.Color(level, level, level);
+    case 1: { // Flash
+      bool on = ((nowMs / 200) & 0x01) == 0;
+      uint8_t v = on ? level : level / 20;
+      return strip.Color(v, v, v);
     }
-    case 2: { // Fade
-      uint8_t phase = ((nowMs / 12) + offset * 4) & 0xFF;
-      uint8_t scaled = scaleBrightness(level, phase);
-      uint8_t tail = scaleBrightness(level, 255 - phase);
-      return pixels.Color(scaled, tail, 0);
+    case 2: { // Chase
+      uint16_t span = group.length == 0 ? 1 : group.length;
+      uint16_t pos = (nowMs / 60) % span;
+      uint8_t intensity = (offset == pos) ? level : level / 16;
+      return strip.Color(intensity, 0, intensity);
     }
-    case 3: { // Glitch
-      uint8_t noise = ((nowMs / 5) + offset * 37) & 0xFF;
-      uint8_t burst = (noise & 0xE0) ? level : level / 6;
-      return pixels.Color(burst, 0, scaleBrightness(level, 64));
+    case 3: { // Twinkle
+      uint8_t noise = (uint8_t)(((nowMs / 5) + offset * 73) & 0xFF);
+      bool burst = noise > 240;
+      if (burst) {
+        return strip.Color(level, level, level);
+      }
+      uint8_t sparkle = scaleBrightness(level, noise);
+      return strip.Color(sparkle / 2, sparkle, sparkle / 3);
     }
-    case 4: { // Chase
-      uint16_t chase = ((nowMs / 30) + offset * 12) % 255;
-      bool on = chase < 128;
-      uint8_t head = on ? level : level / 12;
-      uint8_t tail = on ? scaleBrightness(level, 64) : scaleBrightness(level, 8);
-      return pixels.Color(head, tail, on ? level : 0);
+    case 4: { // Gradient
+      float pos = (group.length > 1) ? (float)offset / (group.length - 1) : 0.0f;
+      uint8_t r = (uint8_t)(level * (1.0f - pos));
+      uint8_t g = (uint8_t)(level * pos);
+      uint8_t b = scaleBrightness(level, 180);
+      return strip.Color(r, g, b);
+    }
+    case 5: { // Wave
+      float phase = (nowMs * 0.005f) + (offset * 0.3f);
+      float intensity = (sinf(phase) + 1.0f) * 0.5f;
+      uint8_t v = (uint8_t)(level * intensity);
+      return strip.Color(0, v, level);
     }
     default:
-      return pixels.Color(level, level, level);
+      return strip.Color(level, level, level);
   }
 }
 
@@ -275,27 +294,33 @@ void renderPixelGroups(bool force = false) {
     return;
   }
   lastPixelFrameMs = now;
-  pixels.clear();
-  for (uint8_t i = 0; i < 4; ++i) {
-    status.ledBrightness[i] = 0;
+  for (uint8_t line = 0; line < LED_LINE_COUNT; ++line) {
+    pixelLines[line].clear();
+    status.ledBrightness[line] = 0;
   }
   for (size_t i = 0; i < MAX_PIXEL_GROUPS; ++i) {
     PixelGroupState &group = pixelGroups[i];
     if (!group.active) continue;
-    if (group.start >= LED_PIXEL_COUNT) continue;
+    uint8_t line = group.line % LED_LINE_COUNT;
+    Adafruit_NeoPixel &strip = pixelLines[line];
+    if (group.start >= LED_PIXELS_PER_LINE) continue;
     if (group.length == 0) group.length = 1;
     uint16_t cappedLength = group.length;
-    if (group.start + cappedLength > LED_PIXEL_COUNT) {
-      cappedLength = LED_PIXEL_COUNT - group.start;
+    if (group.start + cappedLength > LED_PIXELS_PER_LINE) {
+      cappedLength = LED_PIXELS_PER_LINE - group.start;
     }
-    status.ledBrightness[i % 4] = group.brightness;
+    if (group.brightness > status.ledBrightness[line]) {
+      status.ledBrightness[line] = group.brightness;
+    }
     for (uint16_t offset = 0; offset < cappedLength; ++offset) {
       uint32_t color = computeEffectColor(group, offset, now);
-      pixels.setPixelColor(group.start + offset, color);
+      strip.setPixelColor(group.start + offset, color);
     }
     yield();
   }
-  pixels.show();
+  for (uint8_t line = 0; line < LED_LINE_COUNT; ++line) {
+    pixelLines[line].show();
+  }
   yield();
 }
 
@@ -362,25 +387,29 @@ void handleSmokeAction(uint8_t action, uint16_t param) {
 }
 
 void handlePixelAction(uint8_t action, uint16_t param, uint16_t aux) {
-  uint8_t start = aux & 0x00FF;
-  uint8_t length = (aux >> 8) & 0x00FF;
-  if (length == 0) length = LED_PIXEL_COUNT;
-  if (start >= LED_PIXEL_COUNT) start = LED_PIXEL_COUNT - 1;
-  if (length > (LED_PIXEL_COUNT - start)) {
-    length = LED_PIXEL_COUNT - start;
+  uint8_t line = (aux >> 14) & 0x03;
+  uint8_t start = (aux >> 7) & 0x7F;
+  uint8_t length = aux & 0x7F;
+  if (length == 0) length = LED_PIXELS_PER_LINE;
+  if (start >= LED_PIXELS_PER_LINE) start = LED_PIXELS_PER_LINE - 1;
+  if (length > (LED_PIXELS_PER_LINE - start)) {
+    length = LED_PIXELS_PER_LINE - start;
   }
 
   size_t groupIndex = 0;
-  PixelGroupState *group = getPixelGroup(start, length, &groupIndex);
+  PixelGroupState *group = getPixelGroup(line, start, length, &groupIndex);
   if (!group) return;
+  group->line = line % LED_LINE_COUNT;
 
   if (action == ADDON_PIXELS_BRIGHTNESS) {
     group->brightness = constrain(param, 0u, 255u);
+    status.ledBrightness[group->line] = group->brightness;
   } else if (action == ADDON_PIXELS_EFFECT) {
     group->effect = param;
     if (group->brightness == 0) {
       group->brightness = 255;
     }
+    status.ledBrightness[group->line] = group->brightness;
   }
   renderPixelGroups(true);
   yield();
@@ -471,8 +500,11 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
       status.mode = cmd.value ? MODE_MANUAL : MODE_AUTO;
       break;
     case CMD_LED:
-      status.ledBrightness[cmd.id % 4] = cmd.value;
-      pixels.setBrightness(cmd.value);
+      {
+        uint8_t line = cmd.id % LED_LINE_COUNT;
+        status.ledBrightness[line] = cmd.value;
+        pixelLines[line].setBrightness(cmd.value);
+      }
       renderPixelGroups(true);
       break;
     case CMD_MP3_PLAY:
@@ -593,9 +625,12 @@ void setup() {
 
   Wire.begin();
   dht.begin();
-  pixels.begin();
-  pixels.clear();
-  pixels.show();
+  for (uint8_t line = 0; line < LED_LINE_COUNT; ++line) {
+    pixelLines[line].begin();
+    pixelLines[line].setBrightness(255);
+    pixelLines[line].clear();
+    pixelLines[line].show();
+  }
   renderPixelGroups(true);
 
   initRTC();
