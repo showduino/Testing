@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PrizmLink Control</title>
+  <link rel="stylesheet" href="/web/style.css" />
+</head>
+<body data-version="%VERSION%" data-ip="%IP%">
+  <header>
+    <h1>PrizmLink Receiver <span id="version"></span></h1>
+    <p>IP: <span id="ip"></span></p>
+    <div id="connection" class="status disconnected">Disconnected</div>
+  </header>
+
+  <main>
+    <section aria-labelledby="dashboard-heading">
+      <h2 id="dashboard-heading">Dashboard</h2>
+      <div class="grid">
+        <div class="card" aria-live="polite">
+          <h3>FPS</h3>
+          <div id="fps" data-unit="fps">0</div>
+        </div>
+        <div class="card" aria-live="polite">
+          <h3>Packets</h3>
+          <div id="packets">0</div>
+        </div>
+        <div class="card" aria-live="polite">
+          <h3>Manual Override</h3>
+          <div id="manual">false</div>
+        </div>
+        <div class="card" aria-live="polite">
+          <h3>Uptime</h3>
+          <div id="uptime">0s</div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="lighting-heading">
+      <h2 id="lighting-heading">Lighting</h2>
+      <div class="controls">
+        <label for="brightness">Brightness</label>
+        <input type="range" id="brightness" min="0" max="255" value="200" />
+
+        <label for="pixelCount">Pixel Count</label>
+        <input type="number" id="pixelCount" min="1" max="1024" step="1" />
+
+        <button id="saveLighting" type="button">Save Lighting Config</button>
+      </div>
+    </section>
+
+    <section aria-labelledby="logs-heading">
+      <h2 id="logs-heading">Logs & Diagnostics</h2>
+      <div class="controls">
+        <button id="downloadLogs" type="button">Download Latest Run Log</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>
