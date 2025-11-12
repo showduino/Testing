@@ -1,134 +1,179 @@
-const state = {
-  socket: null,
-  reconnectTimer: null,
-  meta: {
-    version: '',
-    ip: '',
-  },
-};
+/* ──────────────────────────────────────────────
+   PRIZMLINK CONTROL APP.JS
+   Handles status updates, lighting control,
+   and WebSocket/HTTP communication
+   ────────────────────────────────────────────── */
 
-const els = {};
+console.log('[PrizmLink] WebUI started');
 
-function $(id) {
-  if (!els[id]) {
-    els[id] = document.getElementById(id);
-  }
-  return els[id];
+// DOM elements (cached lookups)
+const fpsEl = document.getElementById('fps');
+const packetsEl = document.getElementById('packets');
+const manualEl = document.getElementById('manual');
+const uptimeEl = document.getElementById('uptime');
+const connectionEl = document.getElementById('connection');
+const brightnessEl = document.getElementById('brightness');
+const pixelCountEl = document.getElementById('pixelCount');
+const versionEl = document.getElementById('version');
+const ipEl = document.getElementById('ip');
+const downloadLogsBtn = document.getElementById('downloadLogs');
+const saveLightingBtn = document.getElementById('saveLighting');
+
+// Populate meta information from body data attributes
+const metaVersion = document.body.dataset.version || '';
+const metaIp = document.body.dataset.ip || location.hostname || '0.0.0.0';
+
+if (versionEl) versionEl.textContent = metaVersion ? `v${metaVersion}` : 'v0.0.0';
+if (ipEl) ipEl.textContent = metaIp;
+
+// WebSocket connection (falls back to polling if necessary)
+let ws;
+let pollTimer = null;
+const WS_PROTOCOL = location.protocol === 'https:' ? 'wss' : 'ws';
+const wsURL = `${WS_PROTOCOL}://${metaIp}/ws`;
+
+function setConnectionState(connected) {
+  if (!connectionEl) return;
+  connectionEl.textContent = connected ? 'Connected' : 'Disconnected';
+  connectionEl.classList.toggle('connected', connected);
+  connectionEl.classList.toggle('disconnected', !connected);
 }
 
-function updateConnectionStatus(connected) {
-  const statusEl = $('connection');
-  if (!statusEl) return;
-  statusEl.textContent = connected ? 'Connected' : 'Disconnected';
-  statusEl.classList.toggle('connected', connected);
-  statusEl.classList.toggle('disconnected', !connected);
-}
-
-function renderTelemetry(payload) {
-  const fps = typeof payload.fps === 'number' ? payload.fps.toFixed(1) : '-';
-  const packets = payload.packets ?? 0;
-  const manual = payload.manual ? 'Enabled' : 'Disabled';
-  const uptimeSeconds = typeof payload.uptime === 'number'
-    ? Math.round(payload.uptime / 1000)
+function renderTelemetry(data) {
+  if (!data) return;
+  const fpsValue = typeof data.fps === 'number' ? data.fps.toFixed(1) : '0.0';
+  const packetsValue = data.packets ?? 0;
+  const manualValue = data.manual ? 'Enabled' : 'Disabled';
+  const uptimeSeconds = typeof data.uptime === 'number'
+    ? Math.round(data.uptime / 1000)
     : 0;
 
-  $('fps').textContent = fps;
-  $('packets').textContent = packets;
-  $('manual').textContent = manual;
-  $('uptime').textContent = `${uptimeSeconds}s`;
+  if (fpsEl) fpsEl.textContent = fpsValue;
+  if (packetsEl) packetsEl.textContent = packetsValue;
+  if (manualEl) manualEl.textContent = manualValue;
+  if (uptimeEl) uptimeEl.textContent = `${uptimeSeconds}s`;
 }
 
-function connectSocket() {
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = `${protocol}//${location.host}/ws`;
-  const ws = new WebSocket(url);
+function handleMessage(message) {
+  try {
+    const payload = typeof message === 'string' ? JSON.parse(message) : message;
+    renderTelemetry(payload);
+  } catch (err) {
+    console.warn('[PrizmLink] Failed to parse telemetry payload:', err);
+  }
+}
 
-  ws.addEventListener('open', () => {
-    updateConnectionStatus(true);
-    if (state.reconnectTimer) {
-      clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = null;
-    }
-  });
-
-  ws.addEventListener('close', () => {
-    updateConnectionStatus(false);
-    state.reconnectTimer = setTimeout(connectSocket, 2500);
-  });
-
-  ws.addEventListener('error', () => {
-    updateConnectionStatus(false);
-  });
-
-  ws.addEventListener('message', evt => {
+function startPollingFallback() {
+  if (pollTimer) return;
+  console.log('[PrizmLink] Starting HTTP polling fallback');
+  pollTimer = setInterval(async () => {
     try {
-      const payload = JSON.parse(evt.data);
-      renderTelemetry(payload);
+      const res = await fetch('/status');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      handleMessage(data);
+      setConnectionState(true);
     } catch (err) {
-      console.warn('Bad payload', err);
+      setConnectionState(false);
     }
-  });
-
-  state.socket = ws;
+  }, 3000);
 }
 
-async function fetchConfig() {
+function stopPollingFallback() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function connectWebSocket() {
+  try {
+    ws = new WebSocket(wsURL);
+  } catch (err) {
+    console.error('[PrizmLink] WebSocket connect exception:', err);
+    startPollingFallback();
+    return;
+  }
+
+  ws.onopen = () => {
+    console.log('[PrizmLink] Connected to WebSocket');
+    setConnectionState(true);
+    stopPollingFallback();
+  };
+
+  ws.onmessage = (event) => handleMessage(event.data);
+
+  ws.onclose = () => {
+    console.warn('[PrizmLink] WebSocket closed, retrying...');
+    setConnectionState(false);
+    startPollingFallback();
+    setTimeout(connectWebSocket, 3000);
+  };
+
+  ws.onerror = (event) => {
+    console.error('[PrizmLink] WebSocket error:', event);
+    ws.close();
+  };
+}
+
+// Lighting config helpers
+function clamp(value, min, max, fallback) {
+  if (!Number.isFinite(value)) return fallback;
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
+async function loadLightingConfig() {
   try {
     const res = await fetch('/config');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const cfg = await res.json();
-    $('brightness').value = cfg?.pixels?.brightness ?? 200;
-    $('pixelCount').value = cfg?.pixels?.count ?? 300;
+    if (brightnessEl) brightnessEl.value = cfg?.pixels?.brightness ?? 200;
+    if (pixelCountEl) pixelCountEl.value = cfg?.pixels?.count ?? 300;
   } catch (err) {
-    console.error('Failed to load config', err);
+    console.error('[PrizmLink] Failed to load config:', err);
   }
 }
 
-function bindActions() {
-  $('downloadLogs').addEventListener('click', () => {
-    window.location.href = '/logs/run_latest.txt';
-  });
+async function saveLightingConfig() {
+  let pixels = clamp(parseInt(pixelCountEl.value, 10), 1, 1024, 300);
+  let brightness = clamp(parseInt(brightnessEl.value, 10), 0, 255, 200);
 
-  $('saveLighting').addEventListener('click', async () => {
-    let pixels = parseInt($('pixelCount').value, 10);
-    let brightness = parseInt($('brightness').value, 10);
+  pixelCountEl.value = pixels;
+  brightnessEl.value = brightness;
 
-    pixels = Number.isFinite(pixels) ? Math.min(Math.max(pixels, 1), 1024) : 300;
-    brightness = Number.isFinite(brightness) ? Math.min(Math.max(brightness, 0), 255) : 200;
-
-    $('pixelCount').value = pixels;
-    $('brightness').value = brightness;
-
-    const body = JSON.stringify({ pixels: { count: pixels, brightness } });
-    try {
-      await fetch('/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-      });
-    } catch (err) {
-      console.error('Save failed', err);
-    }
-  });
+  const body = JSON.stringify({ pixels: { count: pixels, brightness } });
+  try {
+    const res = await fetch('/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    console.log('[PrizmLink] Lighting config saved');
+  } catch (err) {
+    console.error('[PrizmLink] Save failed:', err);
+  }
 }
 
-function initMeta() {
-  state.meta.version = document.body.dataset.version || '';
-  state.meta.ip = document.body.dataset.ip || '0.0.0.0';
+function bindEvents() {
+  if (downloadLogsBtn) {
+    downloadLogsBtn.addEventListener('click', () => {
+      window.location.href = '/logs/run_latest.txt';
+    });
+  }
 
-  const versionEl = $('version');
-  const ipEl = $('ip');
-
-  if (versionEl) versionEl.textContent = state.meta.version ? `v${state.meta.version}` : '';
-  if (ipEl) ipEl.textContent = state.meta.ip;
+  if (saveLightingBtn) {
+    saveLightingBtn.addEventListener('click', saveLightingConfig);
+  }
 }
 
-function init() {
-  initMeta();
-  updateConnectionStatus(false);
-  connectSocket();
-  fetchConfig();
-  bindActions();
+async function init() {
+  setConnectionState(false);
+  bindEvents();
+  await loadLightingConfig();
+  connectWebSocket();
 }
 
 document.addEventListener('DOMContentLoaded', init);
