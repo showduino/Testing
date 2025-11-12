@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PrizmLink Control</title>
+  <link rel="stylesheet" href="/web/style.css" />
+</head>
+<body data-version="%VERSION%" data-ip="%IP%">
+  <header>
+    <h1>PrizmLink Receiver <span id="version"></span></h1>
+    <p>IP: <span id="ip"></span></p>
+  </header>
+
+  <main>
+    <section>
+      <h2>Dashboard</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>FPS</h3>
+          <div id="fps">0</div>
+        </div>
+        <div class="card">
+          <h3>Packets</h3>
+          <div id="packets">0</div>
+        </div>
+        <div class="card">
+          <h3>Manual Override</h3>
+          <div id="manual">false</div>
+        </div>
+        <div class="card">
+          <h3>Uptime</h3>
+          <div id="uptime">0s</div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Lighting</h2>
+      <label>Brightness
+        <input type="range" id="brightness" min="0" max="255" value="200" />
+      </label>
+      <label>Pixels
+        <input type="number" id="pixelCount" />
+      </label>
+      <button id="saveLighting">Save</button>
+    </section>
+
+    <section>
+      <h2>Logs</h2>
+      <button id="downloadLogs">Download Run Log</button>
+    </section>
+  </main>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>

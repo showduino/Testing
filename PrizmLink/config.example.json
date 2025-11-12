@@ -1,0 +1,80 @@
+{
+  "network": {
+    "ssid": "PrizmLink",
+    "password": "prizm1234",
+    "hostname": "prizmlink",
+    "apFallback": true,
+    "dhcp": true,
+    "multicast": true
+  },
+  "e131": {
+    "start": 1,
+    "count": 2,
+    "channels": 512,
+    "priority": 100
+  },
+  "pixels": {
+    "enabled": true,
+    "count": 300,
+    "pin": 18,
+    "brightness": 220,
+    "sk6812": false,
+    "grbw": false
+  },
+  "dmx": {
+    "enabled": true,
+    "channels": 128,
+    "pin": 17,
+    "fps": 40
+  },
+  "servos": {
+    "enabled": true,
+    "address": 64,
+    "sda": 9,
+    "scl": 8,
+    "joy1X": 4,
+    "joy1Y": 5,
+    "joy2X": 6,
+    "joy2Y": 7,
+    "button1": 35,
+    "button2": 36,
+    "button1Active": 0,
+    "button2Active": 0,
+    "max": 180,
+    "min": 0,
+    "neutral": 90
+  },
+  "pots": {
+    "brightness": 1,
+    "fx": 2
+  },
+  "buttons": {
+    "stop": 12,
+    "cycle": 13,
+    "confirm": 14,
+    "activeLow": true
+  },
+  "oled": {
+    "enabled": true,
+    "sda": 5,
+    "scl": 6,
+    "address": 60
+  },
+  "sd": {
+    "enabled": true,
+    "useSpi": true,
+    "cs": 10,
+    "root": "/"
+  },
+  "web": {
+    "enabled": true,
+    "port": 80,
+    "websocket": true
+  },
+  "failsafe": {
+    "timeout": 5000,
+    "enable": true,
+    "preset": "rainbow",
+    "floor": 32
+  }
+}

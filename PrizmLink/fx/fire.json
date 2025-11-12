@@ -1,0 +1,14 @@
+{
+  "name": "Fire",
+  "type": "palette",
+  "speed": 0.6,
+  "palette": [
+    "#000000",
+    "#1a0400",
+    "#7a0400",
+    "#ff4500",
+    "#ffd700"
+  ],
+  "cooling": 45,
+  "sparking": 80
+}

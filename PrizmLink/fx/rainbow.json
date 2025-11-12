@@ -1,0 +1,13 @@
+{
+  "name": "Rainbow",
+  "type": "gradient",
+  "speed": 1.0,
+  "points": [
+    { "position": 0.0, "color": "#ff0000" },
+    { "position": 0.2, "color": "#ffa500" },
+    { "position": 0.4, "color": "#ffff00" },
+    { "position": 0.6, "color": "#00ff00" },
+    { "position": 0.8, "color": "#0000ff" },
+    { "position": 1.0, "color": "#8000ff" }
+  ]
+}
