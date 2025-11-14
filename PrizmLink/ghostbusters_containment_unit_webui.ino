@@ -19,6 +19,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
+#include <SerialMP3Player.h>
 
 // ===== PIN DEFINITIONS =====
 // Input Pins
@@ -37,6 +38,12 @@ const int ECHO_PIN = 18;              // Ultrasonic Echo
 const int GREEN_LED_PIN = 22;         // System Ready Indicator
 const int RED_LED_PIN = 23;           // Containment Warning
 
+// Audio / Buzzer Pins
+const int MP3_RX_PIN = 16;            // ESP32 RX (connect to MP3 TX)
+const int MP3_TX_PIN = 17;            // ESP32 TX (connect to MP3 RX)
+const int RADAR_BUZZER_PIN = 14;      // Piezo/buzzer for proximity tone
+const int RADAR_BUZZER_CHANNEL = 6;
+
 // Relay Pins
 const int RELAY_GREEN_PIN = 19;       // Green Switch Relay
 const int RELAY_RED_PIN = 21;         // Red Switch Relay
@@ -51,6 +58,7 @@ const unsigned long SMOKE_DURATION_MS = 2000;       // How long smoke effect run
 const unsigned long DEBOUNCE_DELAY_MS = 50;         // Button debounce time
 const unsigned long SENSOR_READ_INTERVAL_MS = 100;  // How often to read ultrasonic
 const unsigned long SERIAL_BAUD_RATE = 115200;
+const unsigned long IDLE_LOOP_INTERVAL_MS = 8000;
 
 // Relay States (Active Low for most relay modules)
 const int RELAY_ON = LOW;
@@ -67,6 +75,23 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 12000;
 AsyncWebServer webServer(80);
 bool wifiConnected = false;
 bool wifiApMode = false;
+SerialMP3Player mp3(MP3_RX_PIN, MP3_TX_PIN);
+bool audioReady = false;
+unsigned long lastIdleLoopMs = 0;
+bool radarToneActive = false;
+
+// MP3 track assignments
+constexpr uint8_t kTrackButtonOrange = 1;
+constexpr uint8_t kTrackButtonRed = 2;
+constexpr uint8_t kTrackEPA = 3;
+constexpr uint8_t kTrackStartup = 4;
+constexpr uint8_t kTrackPowerDown = 5;
+constexpr uint8_t kTrackDoorOpen = 7;
+constexpr uint8_t kTrackTrapInsert = 8;
+constexpr uint8_t kTrackIdleLoop = 9;
+constexpr uint8_t kTrackDoorClose = 10;
+constexpr uint8_t kTrackTrapClean = 11;
+constexpr uint8_t kTrackGreenButton = 6;
 
 // ===== SYSTEM STATES =====
 enum SystemState {
@@ -484,6 +509,11 @@ void resetSystem();
 void populateStatusJson(JsonDocument &doc);
 void respondWithStatus(AsyncWebServerRequest *request);
 String currentIpString();
+void initAudio();
+void playTrack(uint8_t track, const char *label = nullptr);
+void updateIdleAudio();
+void updateRadarAudio();
+void stopRadarTone();
 
 // ===== SETUP FUNCTION =====
 void setup() {
@@ -493,6 +523,7 @@ void setup() {
 
   setupPins();
   resetSystem();
+  initAudio();
   setupWiFi();
   setupWebServer();
 
@@ -505,6 +536,7 @@ void loop() {
   updateSensors();
   handleStateMachine();
   updateOutputs();
+  updateIdleAudio();
 
   // Small delay to prevent excessive CPU usage
   delay(10);
@@ -535,6 +567,11 @@ void setupPins() {
   pinMode(RELAY_ORANGE_PIN, OUTPUT);
   pinMode(RELAY_SMOKE_PIN, OUTPUT);
   pinMode(RELAY_LOCK_PIN, OUTPUT);
+
+  // Radar buzzer (LEDC tone output)
+  ledcSetup(RADAR_BUZZER_CHANNEL, 1000, 10);
+  ledcAttachPin(RADAR_BUZZER_PIN, RADAR_BUZZER_CHANNEL);
+  stopRadarTone();
 
   Serial.println("📌 Pins configured successfully");
 }
@@ -621,6 +658,60 @@ void populateStatusJson(JsonDocument &doc) {
   wifi["ip"] = currentIpString();
 }
 
+// ===== AUDIO HELPERS =====
+void initAudio() {
+  mp3.begin(9600);
+  delay(500);
+  mp3.sendCommand(CMD_SEL_DEV, 0, 2); // select SD-card
+  delay(500);
+  mp3.setVol(25);
+  audioReady = true;
+  Serial.println("🔊 MP3 module ready");
+}
+
+void playTrack(uint8_t track, const char *label) {
+  if (!audioReady) return;
+  mp3.play(track);
+  if (label) {
+    Serial.printf("🔊 Audio: %s (track %u)\n", label, track);
+  } else {
+    Serial.printf("🔊 Audio: track %u\n", track);
+  }
+}
+
+void updateIdleAudio() {
+  if (!audioReady) return;
+  bool doorClosed = isButtonPressed(limitSwitch);
+  bool shouldIdle = (currentState == STATE_READY && doorClosed && !trapDetected);
+  if (!shouldIdle) return;
+  unsigned long now = millis();
+  if (now - lastIdleLoopMs >= IDLE_LOOP_INTERVAL_MS) {
+    lastIdleLoopMs = now;
+    playTrack(kTrackIdleLoop, "Idle loop");
+  }
+}
+
+void stopRadarTone() {
+  ledcWriteTone(RADAR_BUZZER_CHANNEL, 0);
+  radarToneActive = false;
+}
+
+void updateRadarAudio() {
+  bool doorOpen = !isButtonPressed(limitSwitch);
+  if (!doorOpen || trapDetected || currentDistance <= 0 || currentDistance > 150 ||
+      currentState >= STATE_TRAP_DETECTED) {
+    if (radarToneActive) {
+      stopRadarTone();
+    }
+    return;
+  }
+
+  int clampedDistance = constrain(currentDistance, 5, 120);
+  int freq = map(clampedDistance, 120, 5, 400, 2200);
+  ledcWriteTone(RADAR_BUZZER_CHANNEL, freq);
+  radarToneActive = true;
+}
+
 // ===== BUTTON STATE MANAGEMENT =====
 void updateButtonStates() {
   updateButtonState(powerButton, POWER_BUTTON_PIN);
@@ -678,6 +769,7 @@ void updateSensors() {
     lastSensorRead = currentTime;
     currentDistance = measureDistance();
     trapDetected = (currentDistance > 0 && currentDistance < TRAP_DISTANCE_THRESHOLD_CM);
+    updateRadarAudio();
   }
 }
 
@@ -738,7 +830,12 @@ void handleStateMachine() {
     changeState(newState);
   }
 
+  if (isButtonJustPressed(greenSwitch)) {
+    playTrack(kTrackGreenButton, "Green button");
+  }
+
   if (isButtonJustPressed(powerButton) && currentState != STATE_OFF) {
+    playTrack(kTrackPowerDown, "Power down");
     changeState(STATE_OFF);
   }
 }
@@ -747,6 +844,7 @@ void handleStateMachine() {
 SystemState handleStateOff() {
   if (isButtonJustPressed(powerButton)) {
     Serial.println("✅ SYSTEM POWERED ON - Ready Mode");
+    playTrack(kTrackStartup, "Power on");
     return STATE_READY;
   }
   return STATE_OFF;
@@ -835,6 +933,7 @@ SystemState handleStateProcessing() {
   if (isButtonJustReleased(leverSwitch)) {
     Serial.println("🔼 LEVER THROWN UP - CONTAINMENT COMPLETE!");
     Serial.println("🔄 System Ready for Next Operation");
+    playTrack(kTrackTrapClean, "Trap clean");
     return STATE_READY;
   }
   return STATE_PROCESSING;
@@ -868,17 +967,23 @@ void onStateEnter(SystemState state) {
     case STATE_READY:
       break;
     case STATE_DOOR_OPEN:
+      playTrack(kTrackDoorOpen, "Door open");
       break;
     case STATE_TRAP_DETECTED:
+      playTrack(kTrackTrapInsert, "Trap detected");
       break;
     case STATE_DOOR_CLOSED:
+      playTrack(kTrackDoorClose, "Door closed");
       break;
     case STATE_RED_PRESSED:
+      playTrack(kTrackButtonRed, "Red button");
       break;
     case STATE_ORANGE_PRESSED:
+      playTrack(kTrackButtonOrange, "Orange button");
       break;
     case STATE_LEVER_DOWN:
       smokeStartTime = millis();
+      playTrack(kTrackEPA, "Lever down EPA");
       break;
     case STATE_PROCESSING:
       break;
@@ -976,6 +1081,8 @@ void resetSystem() {
 
   trapDetected = false;
   currentDistance = -1;
+  stopRadarTone();
+  lastIdleLoopMs = millis();
 
   Serial.println("🔄 System Reset Complete");
 }
