@@ -29,3 +29,29 @@ constexpr bool EMERGENCY_ACTIVE_LOW = true;
 constexpr uint8_t ADDON_I2C_SDA = SDA;
 constexpr uint8_t ADDON_I2C_SCL = SCL;
 constexpr uint32_t ADDON_I2C_FREQ = 400000;
+
+// MP3 player pins (Dual YX5300 serial modules)
+constexpr uint8_t MP3_AMBIENT_TX = 12;
+constexpr uint8_t MP3_AMBIENT_RX = 11;
+constexpr uint8_t MP3_MACHINE_TX = 38;
+constexpr uint8_t MP3_MACHINE_RX = 37;
+constexpr uint32_t MP3_SERIAL_BAUD = 9600;
+
+// NeoPixel strip definitions
+constexpr uint8_t NEOPIXEL_MACHINE_PIN = 22;
+constexpr uint16_t NEOPIXEL_MACHINE_COUNT = 100;
+
+constexpr uint8_t NEOPIXEL_TIME_DISPLAY_PIN = 23;
+constexpr uint16_t NEOPIXEL_TIME_DISPLAY_COUNT = 100;
+
+constexpr uint8_t NEOPIXEL_CANDLE_PIN = 24;
+constexpr uint8_t NEOPIXEL_CANDLE_COUNT = 9;  // 3 candles * 3 pixels
+
+constexpr uint8_t NEOPIXEL_TIME_CIRCUITS_PIN = 30;
+constexpr uint16_t NEOPIXEL_TIME_CIRCUITS_COUNT = 100;
+
+constexpr uint8_t NEOPIXEL_INDICATOR_PIN = 31;
+constexpr uint16_t NEOPIXEL_INDICATOR_COUNT = 100;
+
+// Buzzer for cute sounds
+constexpr uint8_t BUZZER_PIN = 36;

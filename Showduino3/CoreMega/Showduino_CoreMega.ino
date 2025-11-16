@@ -11,6 +11,7 @@
 #include "duoframe.h"
 #include "emergency.h"
 #include "heartbeat.h"
+#include "pixels.h"
 
 using namespace showduino;
 
@@ -116,6 +117,7 @@ void setup() {
   dmx_scene_begin();
   emergency_begin();
   heartbeat_begin();
+  pixels_begin();
 
   markStatusDirty();
   Serial.println("[CoreMega] Ready");
@@ -127,5 +129,7 @@ void loop() {
   addons_update();
   emergency_update();
   heartbeat_update();
+  audio_update();
+  pixels_update();
   sendStatusIfNeeded();
 }
