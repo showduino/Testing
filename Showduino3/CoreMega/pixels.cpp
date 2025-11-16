@@ -33,6 +33,15 @@ constexpr uint16_t kTimeDisplayFlickerInterval = 20;
 constexpr uint16_t kTimeCircuitInterval = 500;
 constexpr uint16_t kCandleInterval = 80;
 constexpr uint16_t kShockInterval = 70;
+constexpr uint16_t kFadeInterval = 40;
+constexpr uint8_t kFadeStep = 5;
+struct FadeState {
+  bool active = false;
+  bool directionUp = true;
+  uint8_t brightness = 0;
+  uint32_t lastStep = 0;
+} consoleFade;
+
 
 unsigned long lastTwinkle = 0;
 unsigned long lastConsoleFlicker = 0;
@@ -143,6 +152,37 @@ void setIndicesRed(std::initializer_list<uint16_t> indices) {
   timeDisplayStrip.show();
 }
 
+void applyConsoleBrightness(uint8_t brightness) {
+  for (int i = 11; i <= 17 && i < machineStrip.numPixels(); ++i) {
+    machineStrip.setPixelColor(i, machineStrip.Color(brightness, brightness, brightness));
+  }
+  machineStrip.show();
+}
+
+void runConsoleFade(unsigned long now) {
+  if (!consoleFade.active) return;
+  if (now - consoleFade.lastStep < kFadeInterval) return;
+  consoleFade.lastStep = now;
+
+  if (consoleFade.directionUp) {
+    if (consoleFade.brightness >= 255 - kFadeStep) {
+      consoleFade.brightness = 255;
+      consoleFade.active = false;
+    } else {
+      consoleFade.brightness += kFadeStep;
+    }
+  } else {
+    if (consoleFade.brightness <= kFadeStep) {
+      consoleFade.brightness = 0;
+      consoleFade.active = false;
+    } else {
+      consoleFade.brightness -= kFadeStep;
+    }
+  }
+
+  applyConsoleBrightness(consoleFade.brightness);
+}
+
 }  // namespace
 
 void pixels_begin() {
@@ -167,6 +207,7 @@ void pixels_update() {
   runTimeDisplayFlicker(now);
   runCandleFlicker(now);
   runShockEffect(now);
+  runConsoleFade(now);
 }
 
 void pixels_enableTimeCircuitFlicker(bool enabled) { effectFlags.timeCircuitFlicker = enabled; }
@@ -212,23 +253,17 @@ void pixels_showOneEightFourTwo() {
 }
 
 void pixels_consoleFadeIn() {
-  for (int brightness = 0; brightness <= 255; ++brightness) {
-    for (int i = 11; i <= 17 && i < machineStrip.numPixels(); ++i) {
-      machineStrip.setPixelColor(i, machineStrip.Color(brightness, brightness, brightness));
-    }
-    machineStrip.show();
-    delay(70);
-  }
+  consoleFade.directionUp = true;
+  consoleFade.brightness = 0;
+  consoleFade.active = true;
+  consoleFade.lastStep = 0;
 }
 
 void pixels_consoleFadeOut() {
-  for (int brightness = 255; brightness >= 0; --brightness) {
-    for (int i = 11; i <= 17 && i < machineStrip.numPixels(); ++i) {
-      machineStrip.setPixelColor(i, machineStrip.Color(brightness, brightness, brightness));
-    }
-    machineStrip.show();
-    delay(70);
-  }
+  consoleFade.directionUp = false;
+  consoleFade.brightness = 255;
+  consoleFade.active = true;
+  consoleFade.lastStep = 0;
 }
 
 void pixels_setTimeDisplayRaw(uint16_t index, uint32_t color) {
