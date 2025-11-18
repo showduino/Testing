@@ -1,16 +1,13 @@
 /*
   ╔════════════════════════════════════════════════════════════════════════════╗
-  ║     SHOWDUINO STUDIO – GORE FX EDITION v4.3 FINAL                         ║
-  ║  ESP32-S3 + JC8048W550C + GT911 - COMPLETE & STABLE                       ║
+  ║          SHOWDUINO STUDIO – ESP-NOW COMMUNICATIONS EDITION v5.0            ║
+  ║   ESP32-S3 UI (JC8048W550C + GT911) → ESP32-S3 Brain (Showduino Core)     ║
   ║                                                                            ║
-  ║  COMPLETE FEATURES:                                                        ║
-  ║  ✓ Deferred UI Loading (No Watchdog Issues)                              ║
-  ║  ✓ Timeline Sequencer                                                     ║
-  ║  ✓ FX Designer                                                            ║
-  ║  ✓ Color Picker + Gradients                                              ║
-  ║  ✓ Live Preview                                                           ║
-  ║  ✓ Undo/Redo                                                              ║
-  ║  ✓ Blood-Red Theme                                                        ║
+  ║  • Dedicated live control desk UI built with LVGL                          ║
+  ║  • Zero-config ESP-NOW duplex link (binary packets, sub-ms latency)        ║
+  ║  • Manual / Monitor modes, timeline scrub, relay grid, MP3 decks, LEDs     ║
+  ║  • Dynamic status mirroring from the Brain                                  ║
+  ║  • Pairing helper + link quality indicator                                 ║
   ╚════════════════════════════════════════════════════════════════════════════╝
 */
 
@@ -18,16 +15,23 @@
 #include <Arduino_GFX_Library.h>
 #include <lvgl.h>
 #include <TAMC_GT911.h>
+#include <Wire.h>
+#include <ctype.h>
+#include <SPI.h>
+#include <SD.h>
+#include <RTClib.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <cstring>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
-#include <esp_wifi.h>           // TX power control
-#include "soc/soc.h"            // (optional) brownout test
+#include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-
 // ────────────────────────────────────────────────────────────────
-//  HARDWARE DEFINITIONS
+//  HARDWARE DEFINITIONS – JC8048W550C + GT911
 // ────────────────────────────────────────────────────────────────
 #define TFT_BL 2
 #define TFT_DE 40
@@ -56,82 +60,446 @@
 #define TOUCH_INT 38
 #define TOUCH_RST 10
 
-#define SCREEN_W 800
-#define SCREEN_H 480
-#define DRAW_BUF_SIZE (SCREEN_W * 20)
+constexpr uint16_t SCREEN_W = 800;
+constexpr uint16_t SCREEN_H = 480;
+constexpr uint32_t DRAW_BUF_SIZE = SCREEN_W * 24;  // double buffer lines
 
-#define RAW_X_MIN 30
-#define RAW_X_MAX 271
-#define RAW_Y_MIN 18
-#define RAW_Y_MAX 450
-#define PAD_LEFT 10
-#define PAD_RIGHT 5
-#define PAD_TOP 8
-#define PAD_BOTTOM 6
+constexpr int16_t RAW_X_MIN = 30;
+constexpr int16_t RAW_X_MAX = 271;
+constexpr int16_t RAW_Y_MIN = 18;
+constexpr int16_t RAW_Y_MAX = 450;
+constexpr int16_t PAD_LEFT = 10;
+constexpr int16_t PAD_RIGHT = 5;
+constexpr int16_t PAD_TOP = 8;
+constexpr int16_t PAD_BOTTOM = 6;
 
 // ────────────────────────────────────────────────────────────────
 //  GORE FX THEME
 // ────────────────────────────────────────────────────────────────
-#define GORE_BLACK 0x000000
-#define GORE_RED 0xA30000
-#define GORE_DARK_RED 0x550000
-#define GORE_BRIGHT_RED 0xFF0000
-#define GORE_PANEL_BG 0x111111
+constexpr uint32_t GORE_BLACK = 0x000000;
+constexpr uint32_t GORE_RED = 0xA30000;
+constexpr uint32_t GORE_DARK_RED = 0x550000;
+constexpr uint32_t GORE_BRIGHT_RED = 0xFF0000;
+constexpr uint32_t GORE_PANEL_BG = 0x111111;
+constexpr uint32_t GORE_SLATE = 0x1C1C1C;
+
+#ifndef SD_CS_PIN
+#define SD_CS_PIN 10
+#endif
+
+static constexpr const char *SHOW_LIBRARY_DIR = "/shows";
+static constexpr const char *BUILDER_EXPORT_DIR = "/builder";
+static constexpr const char *MP3_SD_MOUNT_CMD = "mp3_scan";
+static constexpr uint8_t BOOT_STAGE_TOTAL = 7;
+static constexpr uint8_t ADDON_PIXEL_LINES = 4;
+static constexpr uint16_t ADDON_PIXELS_PER_LINE = 120;
 
 // ────────────────────────────────────────────────────────────────
-//  WIFI CONFIG
+//  ESP-NOW LINK CONFIG
 // ────────────────────────────────────────────────────────────────
-#define SHOWDUINO_SSID "SHOWDUINO"
-#define SHOWDUINO_PASSWORD "showtime123"
+constexpr uint8_t SHOWDUINO_ESPNOW_CHANNEL = 6;  // must match Brain
+constexpr int SHOWDUINO_MAX_TX_POWER = 78;       // ~20 dBm
+constexpr uint32_t LINK_STALE_MS = 1500;
+constexpr uint32_t LINK_LOST_MS = 5000;
+constexpr uint32_t TIMELINE_MAX_MS = 600000;     // 10 minutes
 
 // ────────────────────────────────────────────────────────────────
-//  GLOBALS
+//  ESP-NOW PACKET DEFINITIONS
 // ────────────────────────────────────────────────────────────────
-Arduino_ESP32RGBPanel *rgbpanel = nullptr;
-Arduino_RGB_Display *gfx = nullptr;
-TAMC_GT911 *ts_ptr = nullptr;
+enum CommandType : uint8_t {
+  CMD_NOP = 0,
+  CMD_RELAY = 1,
+  CMD_CONTROL_MODE = 2,
+  CMD_TIMELINE_PREVIEW = 3,
+  CMD_TIMELINE_PLAY = 4,
+  CMD_MP3_PLAY = 5,
+  CMD_MP3_STOP = 6,
+  CMD_MP3_VOLUME = 7,
+  CMD_LED = 8,
+  CMD_STOP_ALL = 9,
+  CMD_NEXT_CUE = 10,
+  CMD_PREV_CUE = 11,
+  CMD_PING = 12,
+  CMD_TIMELINE_REWIND = 13,
+  CMD_TIMELINE_FWD = 14,
+  CMD_TIMELINE_LOOP = 15,
+  CMD_SYNC_SD = 16,
+  CMD_MP3_SCAN = 17,
+  CMD_REQUEST_FILE_LIST = 18,
+  CMD_ADDON_ACTION = 19
+};
+
+enum ControlMode : uint8_t {
+  MODE_AUTO = 0,
+  MODE_MANUAL = 1
+};
+
+enum AddonAction : uint8_t {
+  ADDON_SMOKE_TRIGGER = 1,
+  ADDON_SMOKE_INTENSITY = 2,
+  ADDON_SMOKE_PURGE = 3,
+  ADDON_PIXELS_BRIGHTNESS = 10,
+  ADDON_PIXELS_EFFECT = 11,
+  ADDON_RELAY_TOGGLE_BASE = 20,
+  ADDON_MP3_PLAY = 30,
+  ADDON_MP3_STOP = 31,
+  ADDON_MP3_VOLUME_A = 32,
+  ADDON_MP3_VOLUME_B = 33,
+  ADDON_MP3_SYNC = 34,
+  ADDON_R3_PRESET = 40
+};
+
+struct ShowduinoCommand {
+  uint8_t type;
+  uint8_t id;
+  uint16_t value;
+  uint32_t position;
+} __attribute__((packed));
+
+struct ShowduinoStatus {
+  uint8_t mode;              // ControlMode
+  uint8_t relays[8];
+  uint8_t mp3Vol[2];
+  uint8_t mp3State[2];       // 0 = stop, 1 = play
+  uint16_t ledBrightness[4];
+  uint32_t timelinePos;      // ms
+  uint8_t activeCue;
+} __attribute__((packed));
+
+static_assert(sizeof(ShowduinoCommand) == 8, "Unexpected ShowduinoCommand size");
+static_assert(sizeof(ShowduinoStatus) == 26, "Unexpected ShowduinoStatus size");
+
+// ────────────────────────────────────────────────────────────────
+//  GLOBAL OBJECTS & BUFFERS
+// ────────────────────────────────────────────────────────────────
+static Arduino_ESP32RGBPanel *rgbpanel = nullptr;
+static Arduino_RGB_Display *gfx = nullptr;
+static TAMC_GT911 *ts_ptr = nullptr;
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf1 = nullptr;
 static lv_color_t *buf2 = nullptr;
 
 // UI Screens
-lv_obj_t *screen_main = nullptr;
-lv_obj_t *screen_timeline = nullptr;
-lv_obj_t *screen_fx_designer = nullptr;
-lv_obj_t *screen_color_picker = nullptr;
-lv_obj_t *crosshair = nullptr;
+static lv_obj_t *screen_main = nullptr;
+static lv_obj_t *screen_timeline = nullptr;
+static lv_obj_t *screen_fx_designer = nullptr;
+static lv_obj_t *screen_live_control = nullptr;
+static lv_obj_t *screen_settings = nullptr;
+static lv_obj_t *screen_diagnostics = nullptr;
+static lv_obj_t *screen_builder = nullptr;
+static lv_obj_t *screen_files = nullptr;
+static lv_obj_t *screen_addons = nullptr;
+static lv_obj_t *crosshair = nullptr;
+
+// Live Control UI elements
+static lv_obj_t *live_mode_btn = nullptr;
+static lv_obj_t *live_mode_label = nullptr;
+static lv_obj_t *live_signal_label = nullptr;
+static lv_obj_t *live_peer_label = nullptr;
+static lv_obj_t *live_timeline_slider = nullptr;
+static lv_obj_t *live_timeline_label = nullptr;
+static lv_obj_t *live_cue_label = nullptr;
+static lv_obj_t *relayButtons[8] = {nullptr};
+static lv_obj_t *mp3VolumeSlider[2] = {nullptr};
+static lv_obj_t *mp3StateLabel[2] = {nullptr};
+static lv_obj_t *ledSlider[4] = {nullptr};
+
+// Settings UI elements
+static lv_obj_t *settings_brightness_slider = nullptr;
+static lv_obj_t *settings_brightness_value = nullptr;
+static lv_obj_t *settings_autopair_switch = nullptr;
+static lv_obj_t *settings_autopair_label = nullptr;
+static lv_obj_t *settings_txpower_slider = nullptr;
+static lv_obj_t *settings_txpower_value = nullptr;
+static lv_obj_t *settings_channel_label = nullptr;
+static lv_obj_t *settings_peer_label = nullptr;
+static lv_obj_t *settings_last_status_label = nullptr;
+static lv_obj_t *settings_ping_label = nullptr;
+static lv_obj_t *settings_timeline_loop_btn = nullptr;
+static lv_obj_t *settings_time_label = nullptr;
+static lv_obj_t *settings_time_input = nullptr;
+static lv_obj_t *settings_time_apply_btn = nullptr;
+
+// Diagnostics UI elements
+static lv_obj_t *diag_mode_label = nullptr;
+static lv_obj_t *diag_relay_label = nullptr;
+static lv_obj_t *diag_mp3_label = nullptr;
+static lv_obj_t *diag_led_label = nullptr;
+static lv_obj_t *diag_timeline_label = nullptr;
+static lv_obj_t *diag_last_update_label = nullptr;
+
+// Builder UI elements
+static lv_obj_t *builder_library_panel = nullptr;
+static lv_obj_t *builder_show_list = nullptr;
+static lv_obj_t *builder_timeline_area = nullptr;
+static lv_obj_t *builder_name_field = nullptr;
+static lv_obj_t *builder_status_label = nullptr;
+static lv_obj_t *builder_save_button = nullptr;
+static lv_obj_t *toast_container = nullptr;
+static lv_obj_t *keyboard = nullptr;
+static lv_obj_t *keyboard_target = nullptr;
+
+struct ShowEntry {
+  lv_obj_t *widget;
+  char name[64];
+  lv_coord_t homeX;
+  lv_coord_t homeY;
+  lv_coord_t dragOffsetX;
+  lv_coord_t dragOffsetY;
+  bool floating;
+};
+
+struct BuilderClip {
+  lv_obj_t *widget;
+  char showName[64];
+  uint32_t startMs;
+  uint8_t lane;
+};
+
+static constexpr size_t MAX_SHOW_LIBRARY_ENTRIES = 64;
+static constexpr size_t MAX_BUILDER_CLIPS = 64;
+static ShowEntry builderShowEntries[MAX_SHOW_LIBRARY_ENTRIES];
+static size_t builderShowCount = 0;
+static BuilderClip builderClips[MAX_BUILDER_CLIPS];
+static size_t builderClipCount = 0;
+
+// File browser UI elements
+static lv_obj_t *files_path_label = nullptr;
+static lv_obj_t *files_list = nullptr;
+static lv_obj_t *files_refresh_btn = nullptr;
+static char files_current_path[128] = "/";
+
+// FX designer library
+static lv_obj_t *fx_library_panel = nullptr;
+static lv_obj_t *fx_library_list = nullptr;
+
+struct FileEntry {
+  lv_obj_t *button;
+  char path[128];
+  bool isDir;
+};
+
+static FileEntry fileEntries[128];
+static size_t fileEntryCount = 0;
+
+struct AddonCardContext;
+
+typedef void (*AddonBuildFn)(AddonCardContext *ctx);
+typedef void (*AddonRefreshFn)(AddonCardContext *ctx, const ShowduinoStatus &status);
+
+struct AddonDefinition {
+  const char *name;
+  const char *category;
+  uint8_t id;
+  AddonBuildFn buildFn;
+  AddonRefreshFn refreshFn;
+  uint8_t i2cAddress;
+  bool requiresI2C;
+};
+
+struct AddonControlRefs {
+  lv_obj_t *sliderPrimary = nullptr;
+  lv_obj_t *sliderSecondary = nullptr;
+  lv_obj_t *dropdown = nullptr;
+  lv_obj_t *toggleButtons[16] = {nullptr};
+  lv_obj_t *statusLabel = nullptr;
+  lv_obj_t *lineDropdown = nullptr;
+  lv_obj_t *groupDropdown = nullptr;
+  lv_obj_t *spinStart = nullptr;
+  lv_obj_t *spinLength = nullptr;
+};
+
+struct AddonCardContext {
+  const AddonDefinition *def = nullptr;
+  uint8_t addonId = 0;
+  lv_obj_t *card = nullptr;
+  AddonControlRefs controls;
+  bool updating = false;
+  uint8_t currentLine = 0;
+};
+
+struct AddonEventPayload {
+  AddonCardContext *ctx;
+  uint8_t action;
+  uint16_t aux;
+};
+
+static constexpr size_t MAX_ADDONS = 8;
+static AddonCardContext addonCardContexts[MAX_ADDONS];
+static size_t addonCardCount = 0;
+static bool updatingAddonUi = false;
+static bool addonAvailable[MAX_ADDONS] = {false};
+static bool i2cDevicePresent[128] = {false};
+
+// User-data backing arrays (stable memory for LVGL callbacks)
+static uint8_t relayIdMap[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+static uint8_t mp3DeckMap[2] = {0, 1};
+static uint8_t ledLineMap[4] = {0, 1, 2, 3};
+
+enum Mp3Action : uint8_t { MP3_ACT_PLAY = 0, MP3_ACT_STOP = 1 };
+struct Mp3ButtonMeta {
+  uint8_t deck;
+  Mp3Action action;
+};
+static Mp3ButtonMeta mp3ButtonMeta[4] = {};
 
 // State
-bool systemReady = false;
-bool uiCreated = false;
-int uiStage = 0;
+static bool systemReady = false;
+static bool uiCreated = false;
+static int uiStage = 0;
+static bool espNowReady = false;
+static bool brainPeerKnown = false;
+static bool autoPairEnabled = true;
+static int currentTxPower = SHOWDUINO_MAX_TX_POWER;
+static uint8_t currentChannel = SHOWDUINO_ESPNOW_CHANNEL;
+static uint8_t brainPeerMac[6] = {0};
+static uint32_t lastStatusMillis = 0;
+static volatile esp_now_send_status_t lastSendStatus = ESP_NOW_SEND_FAIL;
+static volatile uint32_t lastSendMillis = 0;
+static bool timelineLoopEnabled = false;
+static RTC_DS3231 rtc;
+static bool rtcReady = false;
+static DateTime rtcNow;
+static uint32_t lastRtcUpdate = 0;
+
+static ShowduinoStatus latestStatus{};
+static ShowduinoStatus statusBuffer{};
+static volatile bool statusAvailable = false;
+static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool updatingFromStatus = false;
+static bool updatingSettingsUi = false;
+
+// Backlight control
+constexpr uint8_t BACKLIGHT_PWM_CHANNEL = 0;
+constexpr uint32_t BACKLIGHT_PWM_FREQ = 5000;
+constexpr uint8_t BACKLIGHT_PWM_RESOLUTION = 12;  // 0..4095
+static uint8_t displayBrightness = 255;
+
+// Link diagnostics
+static bool pingPending = false;
+static uint32_t lastPingSendMillis = 0;
+static uint32_t lastPingRoundtrip = 0;
+
+// Storage backend
+enum StorageBackend {
+  STORAGE_NONE = 0,
+  STORAGE_SD
+};
+
+static StorageBackend storageBackend = STORAGE_NONE;
+static bool storageReady = false;
+static bool sdMounted = false;
+
+static constexpr uint8_t BUILDER_LANE_COUNT = 4;
+static constexpr lv_coord_t BUILDER_LANE_HEIGHT = 70;
+static constexpr lv_coord_t BUILDER_CLIP_WIDTH = 180;
+static constexpr lv_coord_t BUILDER_CLIP_HEIGHT = 60;
+static uint32_t builderTimelineMs = 600000;
+static constexpr uint32_t BUILDER_TIMELINE_MS_MIN = 60000;
+static constexpr uint32_t BUILDER_TIMELINE_MS_MAX = 1800000;
+
+static lv_timer_t *toast_timer = nullptr;
 
 // ────────────────────────────────────────────────────────────────
-//  BOOT SCREEN
+//  FORWARD DECLARATIONS
 // ────────────────────────────────────────────────────────────────
-void showBootScreen(int stage, const char *message) {
-  gfx->fillScreen(BLACK);
-  gfx->setTextColor(GORE_RED);
-  gfx->setTextSize(3);
+void showBootScreen(int stage, const char *message);
+bool init_lvgl();
+void build_ui_incremental();
+void create_main_menu();
+void create_timeline_screen();
+void create_fx_designer_screen();
+void create_live_control_screen();
+void create_settings_screen();
+void create_diagnostics_screen();
+void create_builder_screen();
+void create_addons_screen();
+void create_file_browser_screen();
+void update_live_controls(const ShowduinoStatus &status);
+void update_link_indicator();
+void update_settings_telemetry();
+void update_diagnostics_panel(const ShowduinoStatus &status);
+void update_addon_cards(const ShowduinoStatus &status);
+void refresh_show_library();
+void builder_show_item_event_cb(lv_event_t *e);
+void builder_clip_event_cb(lv_event_t *e);
+void builder_save_event_cb(lv_event_t *e);
+void builder_clear_workspace();
+void builder_reset_show_item(ShowEntry *entry);
+void builder_add_clip(const char *name, uint32_t startMs, uint8_t lane);
+void builder_clear_event_cb(lv_event_t *e);
+void show_toast(const char *message, uint32_t duration_ms = 2000);
+void hide_toast();
+void attach_keyboard(lv_obj_t *target);
+void detach_keyboard();
+void builder_timeline_slider_event_cb(lv_event_t *e);
+bool init_rtc();
+void update_clock_display();
+bool set_rtc_from_string(const char *input);
+void settings_timeline_control_event_cb(lv_event_t *e);
+void settings_loop_toggle_event_cb(lv_event_t *e);
+void settings_sync_event_cb(lv_event_t *e);
+void settings_time_apply_event_cb(lv_event_t *e);
+void populate_file_browser(const char *path);
+void files_item_event_cb(lv_event_t *e);
+void files_back_event_cb(lv_event_t *e);
+void files_refresh_event_cb(lv_event_t *e);
+void create_fx_library_panel(lv_obj_t *parent);
+void refresh_fx_library();
+void fx_library_item_event_cb(lv_event_t *e);
+void send_timeline_command(CommandType type, uint32_t position = 0, uint16_t value = 0);
+bool send_addon_action(uint8_t addonId, uint8_t action, uint16_t param = 0, uint16_t aux = 0);
+bool send_showduino_command(const ShowduinoCommand &cmd);
+bool init_esp_now();
+void forget_brain_peer();
+void handle_status_queue();
+void refresh_timeline_readout(uint32_t position);
+void update_mp3_state_label(uint8_t deck, uint8_t state);
+void apply_display_brightness(uint8_t level);
+void init_backlight_pwm();
+bool init_storage();
+bool ensure_show_library_dir();
+bool load_show_library_from_storage();
+bool save_builder_to_storage(const char *name);
+void addon_slider_event_cb(lv_event_t *e);
+void addon_button_event_cb(lv_event_t *e);
+void addon_dropdown_event_cb(lv_event_t *e);
+void addon_line_dropdown_event_cb(lv_event_t *e);
+void addon_group_dropdown_event_cb(lv_event_t *e);
+void scan_i2c_bus();
+bool addon_is_available(const AddonDefinition *def);
+void update_addon_availability();
 
-  gfx->setCursor(150, 180);
-  gfx->println("SHOWDUINO STUDIO");
+// LVGL callbacks
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p);
+void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data);
+void mode_toggle_event_cb(lv_event_t *e);
+void timeline_event_cb(lv_event_t *e);
+void relay_event_cb(lv_event_t *e);
+void mp3_volume_event_cb(lv_event_t *e);
+void mp3_transport_event_cb(lv_event_t *e);
+void led_slider_event_cb(lv_event_t *e);
+void toolbar_event_cb(lv_event_t *e);
+void pair_button_event_cb(lv_event_t *e);
+void settings_brightness_event_cb(lv_event_t *e);
+void settings_autopair_event_cb(lv_event_t *e);
+void settings_txpower_event_cb(lv_event_t *e);
+void settings_ping_event_cb(lv_event_t *e);
+void settings_back_event_cb(lv_event_t *e);
+void diagnostics_back_event_cb(lv_event_t *e);
 
-  gfx->setTextSize(2);
-  gfx->setCursor(200, 230);
-  gfx->println("Gore FX Edition v4.3");
+// ESP-NOW callbacks
+void on_espnow_recv(const uint8_t *mac, const uint8_t *incomingData, int len);
+void on_espnow_sent(const uint8_t *mac, esp_now_send_status_t status);
+bool ensure_peer_registered(const uint8_t *mac);
 
-  gfx->setTextSize(1);
-  gfx->setCursor(300, 270);
-  gfx->printf("Stage %d/5", stage);
-
-  gfx->setCursor(250, 290);
-  gfx->println(message);
-}
+// Utility
+void format_timecode(uint32_t ms, char *buffer, size_t len);
 
 // ────────────────────────────────────────────────────────────────
-//  LVGL CALLBACKS
+//  DISPLAY FLUSH
 // ────────────────────────────────────────────────────────────────
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   if (!gfx) {
@@ -145,6 +513,9 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
   lv_disp_flush_ready(disp);
 }
 
+// ────────────────────────────────────────────────────────────────
+//  TOUCH DRIVER
+// ────────────────────────────────────────────────────────────────
 void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
   if (!ts_ptr) {
     data->state = LV_INDEV_STATE_REL;
@@ -160,14 +531,13 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
     int16_t x = map(rawY, RAW_Y_MAX, RAW_Y_MIN, PAD_LEFT, SCREEN_W - 1 - PAD_RIGHT);
     int16_t y = map(rawX, RAW_X_MIN, RAW_X_MAX, PAD_TOP, SCREEN_H - 1 - PAD_BOTTOM);
 
-    data->point.x = constrain(x, 0, SCREEN_W - 1);
-    data->point.y = constrain(y, 0, SCREEN_H - 1);
+    data->point.x = constrain(x, 0, static_cast<int16_t>(SCREEN_W - 1));
+    data->point.y = constrain(y, 0, static_cast<int16_t>(SCREEN_H - 1));
     data->state = LV_INDEV_STATE_PR;
 
-    // Animate crosshair
     if (crosshair) {
       lv_obj_clear_flag(crosshair, LV_OBJ_FLAG_HIDDEN);
-      lv_obj_set_pos(crosshair, x - 10, y - 10);
+      lv_obj_set_pos(crosshair, data->point.x - 10, data->point.y - 10);
     }
   } else {
     data->state = LV_INDEV_STATE_REL;
@@ -177,6 +547,309 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
   }
 }
 
+bool init_storage() {
+  yield();
+  if (storageBackend == STORAGE_SD && sdMounted) {
+    yield();
+    return true;
+  }
+
+#ifdef SD_SCK_PIN
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+#else
+  SPI.begin();
+#endif
+  yield();
+
+  if (SD.begin(SD_CS_PIN)) {
+    storageBackend = STORAGE_SD;
+    sdMounted = true;
+    storageReady = true;
+    Serial.println("[STORAGE] SD card mounted as primary storage");
+    ensure_show_library_dir();
+    const char *registryPath = "/builder/registry.txt";
+    if (!SD.exists(registryPath)) {
+      File regFile = SD.open(registryPath, FILE_WRITE);
+      if (regFile) {
+        regFile.println("# Show Registry");
+        regFile.close();
+      }
+      yield();
+    }
+    yield();
+    return true;
+  }
+
+  storageBackend = STORAGE_NONE;
+  sdMounted = false;
+  storageReady = false;
+  Serial.println("[STORAGE] ⚠️ SD card not detected – using transient memory only");
+  yield();
+  return false;
+}
+
+bool ensure_show_library_dir() {
+  yield();
+  if (storageBackend != STORAGE_SD || !sdMounted) return false;
+  if (!SD.exists(SHOW_LIBRARY_DIR)) {
+    SD.mkdir(SHOW_LIBRARY_DIR);
+    yield();
+  }
+  if (!SD.exists(BUILDER_EXPORT_DIR)) {
+    SD.mkdir(BUILDER_EXPORT_DIR);
+    yield();
+  }
+  return true;
+}
+
+static void sanitise_show_name(const char *source, char *dest, size_t destLen) {
+  size_t di = 0;
+  for (size_t i = 0; source[i] != '\0' && di < destLen - 1; ++i) {
+    char c = source[i];
+    if (c == '.' || c == '/' || c == '\\') break;
+    if (isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ' ') {
+      dest[di++] = c;
+    } else {
+      dest[di++] = '_';
+    }
+  }
+  dest[di] = '\0';
+}
+
+bool load_show_library_from_storage() {
+  builderShowCount = 0;
+  yield();
+
+  if (init_storage() && storageBackend == STORAGE_SD && sdMounted) {
+    ensure_show_library_dir();
+    File dir = SD.open(SHOW_LIBRARY_DIR);
+    if (dir) {
+      while (true) {
+        yield();
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory() && builderShowCount < MAX_SHOW_LIBRARY_ENTRIES) {
+          const char *rawName = entry.name();
+          const char *leaf = strrchr(rawName, '/');
+          leaf = leaf ? leaf + 1 : rawName;
+          char cleaned[64]{0};
+          sanitise_show_name(leaf, cleaned, sizeof(cleaned));
+          if (cleaned[0] != '\0') {
+            ShowEntry &slot = builderShowEntries[builderShowCount++];
+            memset(&slot, 0, sizeof(slot));
+            strncpy(slot.name, cleaned, sizeof(slot.name) - 1);
+            yield();
+          }
+        }
+        entry.close();
+      }
+      dir.close();
+    }
+  }
+
+  if (builderShowCount == 0) {
+    ShowEntry &slot = builderShowEntries[builderShowCount++];
+    memset(&slot, 0, sizeof(slot));
+    strncpy(slot.name, "Demo FX Cue", sizeof(slot.name) - 1);
+    yield();
+  }
+
+  return builderShowCount > 0;
+}
+
+bool save_builder_to_storage(const char *name) {
+  if (!name || !*name) return false;
+  if (!init_storage() || storageBackend != STORAGE_SD || !sdMounted) return false;
+  ensure_show_library_dir();
+  yield();
+
+  char safeName[64];
+  sanitise_show_name(name, safeName, sizeof(safeName));
+  if (safeName[0] == '\0') {
+    strncpy(safeName, "untitled_show", sizeof(safeName) - 1);
+  }
+
+  String path = String(BUILDER_EXPORT_DIR) + "/" + safeName + ".show";
+  File file = SD.open(path.c_str(), FILE_WRITE);
+  if (!file) {
+    Serial.printf("[STORAGE] ❌ Failed to open %s for writing\n", path.c_str());
+    return false;
+  }
+  yield();
+
+  file.print("{\"clips\":[");
+  for (size_t i = 0; i < builderClipCount; ++i) {
+    const BuilderClip &clip = builderClips[i];
+    file.printf("{\"show\":\"%s\",\"lane\":%u,\"start\":%lu,\"length\":%lu}",
+                clip.showName,
+                static_cast<unsigned>(clip.lane),
+                static_cast<unsigned long>(clip.startMs),
+                static_cast<unsigned long>(builderTimelineMs / 16));
+    if (i + 1 < builderClipCount) file.print(",");
+    yield();
+  }
+  file.print("]}");
+  file.close();
+  String registryPath = String(BUILDER_EXPORT_DIR) + "/registry.txt";
+  File registry = SD.open(registryPath.c_str(), FILE_APPEND);
+  if (registry) {
+    registry.printf("%s.show\n", safeName);
+    registry.close();
+    yield();
+  }
+  Serial.printf("[STORAGE] ✓ Builder arrangement saved to %s\n", path.c_str());
+  return true;
+}
+
+void scan_i2c_bus() {
+  memset(i2cDevicePresent, 0, sizeof(i2cDevicePresent));
+  Serial.println("[I2C] Scanning bus for add-ons...");
+  for (uint8_t addr = 1; addr < 0x7F; ++addr) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      i2cDevicePresent[addr] = true;
+      Serial.printf("[I2C] ✓ Detected device at 0x%02X\n", addr);
+    }
+    yield();
+  }
+}
+
+bool addon_is_available(const AddonDefinition *def) {
+  if (!def) return false;
+  if (!def->requiresI2C) return true;
+  if (def->i2cAddress == 0) return false;
+  uint8_t addr = def->i2cAddress & 0x7F;
+  return i2cDevicePresent[addr];
+}
+
+void update_addon_availability() {
+  for (size_t i = 0; i < addonDefinitionCount && i < MAX_ADDONS; ++i) {
+    const AddonDefinition *def = &addonDefinitions[i];
+    bool available = addon_is_available(def);
+    addonAvailable[i] = available;
+    if (def->requiresI2C) {
+      Serial.printf("[ADDON] %s %s (I2C 0x%02X) -> %s\n",
+                    def->name,
+                    def->category,
+                    def->i2cAddress,
+                    available ? "available" : "missing");
+    } else {
+      Serial.printf("[ADDON] %s %s -> %s\n",
+                    def->name,
+                    def->category,
+                    available ? "enabled" : "disabled");
+    }
+    yield();
+  }
+  for (size_t i = addonDefinitionCount; i < MAX_ADDONS; ++i) {
+    addonAvailable[i] = false;
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+//  UI FEEDBACK HELPERS
+// ────────────────────────────────────────────────────────────────
+static void toast_timer_cb(lv_timer_t *timer) {
+  (void)timer;
+  hide_toast();
+}
+
+void hide_toast() {
+  if (!toast_container) return;
+  lv_obj_add_flag(toast_container, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t *label = lv_obj_get_child(toast_container, 0);
+  if (label) lv_label_set_text(label, "");
+  if (toast_timer) {
+    lv_timer_del(toast_timer);
+    toast_timer = nullptr;
+  }
+}
+
+void show_toast(const char *message, uint32_t duration_ms) {
+  if (!toast_container) return;
+  lv_obj_clear_flag(toast_container, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t *label = lv_obj_get_child(toast_container, 0);
+  if (label) {
+    lv_label_set_text(label, message ? message : "");
+    lv_obj_center(label);
+  }
+  if (toast_timer) {
+    lv_timer_set_period(toast_timer, duration_ms);
+    lv_timer_reset(toast_timer);
+  } else {
+    toast_timer = lv_timer_create(toast_timer_cb, duration_ms, nullptr);
+  }
+}
+
+void attach_keyboard(lv_obj_t *target) {
+  if (!target) return;
+  if (!keyboard) {
+    keyboard = lv_keyboard_create(lv_scr_act());
+    lv_obj_set_size(keyboard, SCREEN_W, SCREEN_H / 3);
+    lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+  }
+  keyboard_target = target;
+  lv_keyboard_set_textarea(keyboard, target);
+  lv_obj_clear_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+void detach_keyboard() {
+  if (!keyboard) return;
+  lv_keyboard_set_textarea(keyboard, nullptr);
+  lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+  keyboard_target = nullptr;
+}
+
+bool init_rtc() {
+  rtcReady = rtc.begin();
+  if (!rtcReady) {
+    Serial.println("[RTC] ⚠️ DS3231 not detected");
+    return false;
+  }
+  if (rtc.lostPower()) {
+    Serial.println("[RTC] ⚠️ Lost power, setting compile time by default");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  rtcNow = rtc.now();
+  update_clock_display();
+  Serial.printf("[RTC] ✓ Initialised: %04d-%02d-%02d %02d:%02d:%02d\n",
+                rtcNow.year(), rtcNow.month(), rtcNow.day(),
+                rtcNow.hour(), rtcNow.minute(), rtcNow.second());
+  return true;
+}
+
+void update_clock_display() {
+  if (!settings_time_label) return;
+  if (!rtcReady) {
+    lv_label_set_text(settings_time_label, "RTC: unavailable");
+    return;
+  }
+  rtcNow = rtc.now();
+  char buf[64];
+  snprintf(buf, sizeof(buf), "RTC: %04d-%02d-%02d %02d:%02d:%02d",
+           rtcNow.year(), rtcNow.month(), rtcNow.day(),
+           rtcNow.hour(), rtcNow.minute(), rtcNow.second());
+  lv_label_set_text(settings_time_label, buf);
+}
+
+bool set_rtc_from_string(const char *input) {
+  if (!input || !rtcReady) return false;
+  int year, month, day, hour, minute, second;
+  if (sscanf(input, "%d-%d-%d %d:%d:%d",
+             &year, &month, &day, &hour, &minute, &second) != 6) {
+    return false;
+  }
+  if (year < 2000 || year > 2099) return false;
+  DateTime dt(year, month, day, hour, minute, second);
+  rtc.adjust(dt);
+  rtcNow = dt;
+  update_clock_display();
+  return true;
+}
+
 // ────────────────────────────────────────────────────────────────
 //  LVGL INIT
 // ────────────────────────────────────────────────────────────────
@@ -184,11 +857,16 @@ bool init_lvgl() {
   lv_init();
 
   buf1 = (lv_color_t *)ps_malloc(sizeof(lv_color_t) * DRAW_BUF_SIZE);
-  if (!buf1) return false;
+  if (!buf1) {
+    Serial.println("[LVGL] ❌ Failed to allocate buffer 1 (PSRAM)");
+    return false;
+  }
 
   buf2 = (lv_color_t *)ps_malloc(sizeof(lv_color_t) * DRAW_BUF_SIZE);
   if (!buf2) {
+    Serial.println("[LVGL] ❌ Failed to allocate buffer 2 (PSRAM)");
     free(buf1);
+    buf1 = nullptr;
     return false;
   }
 
@@ -212,290 +890,2349 @@ bool init_lvgl() {
 }
 
 // ────────────────────────────────────────────────────────────────
-//  DEFERRED UI CREATION - MAIN MENU
+//  BOOT SCREEN HELPERS
+// ────────────────────────────────────────────────────────────────
+void showBootScreen(int stage, const char *message) {
+  if (!gfx) return;
+
+  gfx->fillScreen(BLACK);
+  gfx->setTextColor(GORE_RED);
+  gfx->setTextSize(3);
+  gfx->setCursor(150, 170);
+  gfx->println("SHOWDUINO STUDIO");
+
+  gfx->setTextSize(2);
+  gfx->setCursor(180, 215);
+  gfx->println("ESP-NOW Communications Edition v5.0");
+
+  gfx->setTextSize(1);
+  gfx->setCursor(280, 260);
+  gfx->printf("Stage %d/%d", stage, BOOT_STAGE_TOTAL);
+
+  gfx->setCursor(200, 285);
+  gfx->println(message);
+}
+
+// ────────────────────────────────────────────────────────────────
+//  MAIN MENU
 // ────────────────────────────────────────────────────────────────
 void create_main_menu() {
   Serial.println("[UI] Creating main menu...");
-  yield();
 
   screen_main = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(screen_main, lv_color_hex(GORE_BLACK), 0);
-  yield();
+  lv_obj_set_style_bg_color(screen_main, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
 
-  // Header
   lv_obj_t *header = lv_label_create(screen_main);
   lv_label_set_text(header, "SHOWDUINO STUDIO");
-  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_text_font(header, &lv_font_montserrat_28, 0);
-  lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 20);
-  yield();
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_30, LV_PART_MAIN);
+  lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 24);
 
-  // Subtitle
   lv_obj_t *subtitle = lv_label_create(screen_main);
-  lv_label_set_text(subtitle, "Gore FX Edition v4.3 - STABLE & COMPLETE");
-  lv_obj_set_style_text_color(subtitle, lv_color_hex(GORE_DARK_RED), 0);
-  lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_16, 0);
-  lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 60);
-  yield();
+  lv_label_set_text(subtitle, "Gore FX – ESP-NOW Link Ready");
+  lv_obj_set_style_text_color(subtitle, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 68);
 
-  // New Project button
-  lv_obj_t *btn_new = lv_btn_create(screen_main);
-  lv_obj_set_size(btn_new, 300, 80);
-  lv_obj_align(btn_new, LV_ALIGN_CENTER, 0, -60);
-  lv_obj_set_style_bg_color(btn_new, lv_color_hex(GORE_RED), 0);
-  lv_obj_add_event_cb(
-    btn_new, [](lv_event_t *e) {
-      Serial.println("[UI] New Project clicked");
-      if (screen_timeline) lv_scr_load(screen_timeline);
-    },
-    LV_EVENT_CLICKED, NULL);
-  yield();
+  lv_obj_t *menu_panel = lv_obj_create(screen_main);
+  lv_obj_set_size(menu_panel, 360, 360);
+  lv_obj_align(menu_panel, LV_ALIGN_CENTER, 0, 30);
+  lv_obj_set_style_bg_color(menu_panel, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(menu_panel, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(menu_panel, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(menu_panel, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(menu_panel, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(menu_panel, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(menu_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_SPACE_AROUND);
 
-  lv_obj_t *label_new = lv_label_create(btn_new);
-  lv_label_set_text(label_new, LV_SYMBOL_PLUS " NEW PROJECT");
-  lv_obj_set_style_text_font(label_new, &lv_font_montserrat_20, 0);
-  lv_obj_center(label_new);
-  yield();
+  auto make_button = [](lv_obj_t *parent, const char *text) {
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, LV_PCT(100), 70);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(GORE_RED), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 10, LV_PART_MAIN);
 
-  // FX Designer button
-  lv_obj_t *btn_fx = lv_btn_create(screen_main);
-  lv_obj_set_size(btn_fx, 300, 80);
-  lv_obj_align(btn_fx, LV_ALIGN_CENTER, 0, 40);
-  lv_obj_set_style_bg_color(btn_fx, lv_color_hex(GORE_PANEL_BG), 0);
-  lv_obj_set_style_border_color(btn_fx, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_border_width(btn_fx, 2, 0);
-  lv_obj_add_event_cb(
-    btn_fx, [](lv_event_t *e) {
-      Serial.println("[UI] FX Designer clicked");
-      if (screen_fx_designer) lv_scr_load(screen_fx_designer);
-    },
-    LV_EVENT_CLICKED, NULL);
-  yield();
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_center(label);
+    return btn;
+  };
 
-  lv_obj_t *label_fx = lv_label_create(btn_fx);
-  lv_label_set_text(label_fx, LV_SYMBOL_IMAGE " FX DESIGNER");
-  lv_obj_set_style_text_font(label_fx, &lv_font_montserrat_20, 0);
-  lv_obj_center(label_fx);
-  yield();
+  lv_obj_t *btn_live = make_button(menu_panel, LV_SYMBOL_WIFI " LIVE CONTROL");
+  lv_obj_add_event_cb(btn_live, [](lv_event_t *e) {
+    if (screen_live_control) {
+      lv_scr_load_anim(screen_live_control, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    }
+  }, LV_EVENT_CLICKED, NULL);
 
-  // Status footer
+  lv_obj_t *btn_timeline = make_button(menu_panel, LV_SYMBOL_PLAY " TIMELINE EDITOR");
+  lv_obj_add_event_cb(btn_timeline, [](lv_event_t *e) {
+    if (screen_timeline) {
+      lv_scr_load_anim(screen_timeline, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btn_fx = make_button(menu_panel, LV_SYMBOL_IMAGE " FX DESIGNER");
+  lv_obj_add_event_cb(btn_fx, [](lv_event_t *e) {
+    if (screen_fx_designer) {
+      lv_scr_load_anim(screen_fx_designer, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btn_builder = make_button(menu_panel, LV_SYMBOL_AUDIO " SHOW BUILDER");
+  lv_obj_add_event_cb(btn_builder, [](lv_event_t *e) {
+    if (screen_builder) {
+      lv_scr_load_anim(screen_builder, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    } else {
+      Serial.println("[UI] Builder screen not initialised yet.");
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btn_addons = make_button(menu_panel, LV_SYMBOL_PLUG " ADD-ONS");
+  lv_obj_add_event_cb(btn_addons, [](lv_event_t *e) {
+    if (screen_addons) {
+      lv_scr_load_anim(screen_addons, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    } else {
+      Serial.println("[UI] Add-ons screen not initialised yet.");
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btn_settings = make_button(menu_panel, LV_SYMBOL_SETTINGS " SETTINGS");
+  lv_obj_add_event_cb(btn_settings, [](lv_event_t *e) {
+    if (screen_settings) {
+      lv_scr_load_anim(screen_settings, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btn_diag = make_button(menu_panel, LV_SYMBOL_LIST " DIAGNOSTICS");
+  lv_obj_add_event_cb(btn_diag, [](lv_event_t *e) {
+    if (screen_diagnostics) {
+      lv_scr_load_anim(screen_diagnostics, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
   lv_obj_t *footer = lv_label_create(screen_main);
-  char statusStr[128];
-  snprintf(statusStr, sizeof(statusStr),
-           "WiFi: %s | Free: %dKB | PSRAM: %dKB | READY",
-           WiFi.status() == WL_CONNECTED ? "Connected" : "Offline",
-           ESP.getFreeHeap() / 1024,
-           ESP.getFreePsram() / 1024);
-  lv_label_set_text(footer, statusStr);
-  lv_obj_set_style_text_color(footer, lv_color_hex(GORE_DARK_RED), 0);
-  lv_obj_align(footer, LV_ALIGN_BOTTOM_MID, 0, -10);
-  yield();
+  lv_label_set_text(footer, "ESP-NOW Link: tap LIVE CONTROL to pair");
+  lv_obj_set_style_text_color(footer, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_align(footer, LV_ALIGN_BOTTOM_MID, 0, -12);
 
-  // Crosshair
+  // Crosshair for touch debug
   crosshair = lv_obj_create(screen_main);
-  lv_obj_set_size(crosshair, 20, 20);
-  lv_obj_set_style_bg_color(crosshair, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_border_width(crosshair, 0, 0);
-  lv_obj_set_style_radius(crosshair, 10, 0);
-  lv_obj_add_flag(crosshair, LV_OBJ_FLAG_FLOATING);
-  lv_obj_add_flag(crosshair, LV_OBJ_FLAG_HIDDEN);
-  yield();
+  lv_obj_set_size(crosshair, 24, 24);
+  lv_obj_set_style_bg_color(crosshair, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(crosshair, 12, LV_PART_MAIN);
+  lv_obj_add_flag(crosshair, LV_OBJ_FLAG_FLOATING | LV_OBJ_FLAG_HIDDEN);
 
   lv_scr_load(screen_main);
   Serial.println("[UI] Main menu complete");
 }
 
 // ────────────────────────────────────────────────────────────────
-//  TIMELINE SCREEN
+//  TIMELINE SCREEN (placeholder)
 // ────────────────────────────────────────────────────────────────
 void create_timeline_screen() {
-  Serial.println("[UI] Creating timeline...");
-  yield();
+  Serial.println("[UI] Creating timeline editor...");
 
   screen_timeline = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(screen_timeline, lv_color_hex(GORE_BLACK), 0);
-  yield();
+  lv_obj_set_style_bg_color(screen_timeline, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
 
-  // Header
   lv_obj_t *header = lv_label_create(screen_timeline);
   lv_label_set_text(header, LV_SYMBOL_PLAY " TIMELINE EDITOR");
-  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_text_font(header, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_24, LV_PART_MAIN);
   lv_obj_align(header, LV_ALIGN_TOP_LEFT, 20, 20);
-  yield();
 
-  // ────────────────────────────────────────────────
-  //  BACK BUTTON (fixed & animated)
-  // ────────────────────────────────────────────────
   lv_obj_t *btn_back = lv_btn_create(screen_timeline);
-  lv_obj_set_size(btn_back, 100, 50);
-  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -20, 15);
-  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_border_width(btn_back, 0, 0);
+  lv_obj_set_size(btn_back, 110, 48);
+  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -20, 18);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn_back, 0, LV_PART_MAIN);
 
   lv_obj_t *label_back = lv_label_create(btn_back);
   lv_label_set_text(label_back, LV_SYMBOL_LEFT " BACK");
   lv_obj_center(label_back);
 
-  // improved callback
   lv_obj_add_event_cb(btn_back, [](lv_event_t *e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t *target = lv_event_get_target(e);
-
-    if (code == LV_EVENT_PRESSED) {
-      lv_obj_set_style_bg_color(target, lv_color_hex(GORE_DARK_RED), 0);
+    if (screen_main) {
+      lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
     }
-    else if (code == LV_EVENT_RELEASED) {
-      lv_obj_set_style_bg_color(target, lv_color_hex(GORE_RED), 0);
-    }
-    else if (code == LV_EVENT_CLICKED) {
-      Serial.println("[UI] Back button pressed → returning to main menu");
-      lv_anim_del_all();  // cancel any active anims
-      if (screen_main) {
-        lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
-      } else {
-        Serial.println("[WARN] screen_main not built yet!");
-      }
-    }
-  }, LV_EVENT_ALL, NULL);
+  }, LV_EVENT_CLICKED, NULL);
 
-  yield();
-
-  // ────────────────────────────────────────────────
-  //  Timeline Canvas Placeholder
-  // ────────────────────────────────────────────────
   lv_obj_t *timeline_area = lv_obj_create(screen_timeline);
   lv_obj_set_size(timeline_area, 760, 360);
   lv_obj_align(timeline_area, LV_ALIGN_CENTER, 0, 20);
-  lv_obj_set_style_bg_color(timeline_area, lv_color_hex(GORE_PANEL_BG), 0);
-  lv_obj_set_style_border_color(timeline_area, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_border_width(timeline_area, 2, 0);
-  yield();
+  lv_obj_set_style_bg_color(timeline_area, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(timeline_area, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(timeline_area, 2, LV_PART_MAIN);
 
   lv_obj_t *placeholder = lv_label_create(timeline_area);
   lv_label_set_text(placeholder,
-    "TIMELINE SEQUENCER\n\n"
-    "• Drag to create segments\n"
-    "• Click segment to add FX\n"
-    "• Sync to music beats\n\n"
-    "Ready to create amazing shows!");
-  lv_obj_set_style_text_color(placeholder, lv_color_hex(GORE_DARK_RED), 0);
-  lv_obj_set_style_text_align(placeholder, LV_TEXT_ALIGN_CENTER, 0);
+                    "TIMELINE SEQUENCER\n\n"
+                    "• Drag to build cues\n"
+                    "• Assign FX + hardware actions\n"
+                    "• Sync to MP3 beat grid\n"
+                    "• Tap cue to live preview\n\n"
+                    "ESP-NOW link keeps Brain locked to timeline.");
+  lv_obj_set_style_text_color(placeholder, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_align(placeholder, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
   lv_obj_center(placeholder);
 
-  Serial.println("[UI] Timeline complete");
+  Serial.println("[UI] Timeline editor ready");
 }
 
-
 // ────────────────────────────────────────────────────────────────
-//  FX DESIGNER SCREEN
+//  FX DESIGNER SCREEN (placeholder)
 // ────────────────────────────────────────────────────────────────
 void create_fx_designer_screen() {
   Serial.println("[UI] Creating FX designer...");
-  yield();
 
   screen_fx_designer = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(screen_fx_designer, lv_color_hex(GORE_BLACK), 0);
-  yield();
+  lv_obj_set_style_bg_color(screen_fx_designer, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
 
-  // Header
   lv_obj_t *header = lv_label_create(screen_fx_designer);
   lv_label_set_text(header, LV_SYMBOL_IMAGE " FX DESIGNER");
-  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_text_font(header, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_24, LV_PART_MAIN);
   lv_obj_align(header, LV_ALIGN_TOP_LEFT, 20, 20);
-  yield();
 
-  // ────────────────────────────────────────────────
-  //  BACK BUTTON (same behavior as Timeline)
-  // ────────────────────────────────────────────────
   lv_obj_t *btn_back = lv_btn_create(screen_fx_designer);
-  lv_obj_set_size(btn_back, 100, 50);
-  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -20, 15);
-  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_border_width(btn_back, 0, 0);
+  lv_obj_set_size(btn_back, 110, 48);
+  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -20, 18);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn_back, 0, LV_PART_MAIN);
 
   lv_obj_t *label_back = lv_label_create(btn_back);
   lv_label_set_text(label_back, LV_SYMBOL_LEFT " BACK");
   lv_obj_center(label_back);
 
   lv_obj_add_event_cb(btn_back, [](lv_event_t *e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t *target = lv_event_get_target(e);
-
-    if (code == LV_EVENT_PRESSED) {
-      lv_obj_set_style_bg_color(target, lv_color_hex(GORE_DARK_RED), 0);
+    if (screen_main) {
+      lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
     }
-    else if (code == LV_EVENT_RELEASED) {
-      lv_obj_set_style_bg_color(target, lv_color_hex(GORE_RED), 0);
-    }
-    else if (code == LV_EVENT_CLICKED) {
-      Serial.println("[UI] Back button pressed → returning to main menu");
-      lv_anim_del_all();
-      if (screen_main) {
-        lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
-      } else {
-        Serial.println("[WARN] screen_main not built yet!");
-      }
-    }
-  }, LV_EVENT_ALL, NULL);
+  }, LV_EVENT_CLICKED, NULL);
 
-  yield();
-
-  // ────────────────────────────────────────────────
-  //  FX Preview Area
-  // ────────────────────────────────────────────────
   lv_obj_t *preview_area = lv_obj_create(screen_fx_designer);
   lv_obj_set_size(preview_area, 760, 360);
   lv_obj_align(preview_area, LV_ALIGN_CENTER, 0, 20);
-  lv_obj_set_style_bg_color(preview_area, lv_color_hex(GORE_PANEL_BG), 0);
-  lv_obj_set_style_border_color(preview_area, lv_color_hex(GORE_RED), 0);
-  lv_obj_set_style_border_width(preview_area, 2, 0);
-  yield();
+  lv_obj_set_style_bg_color(preview_area, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(preview_area, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(preview_area, 2, LV_PART_MAIN);
 
   lv_obj_t *placeholder = lv_label_create(preview_area);
   lv_label_set_text(placeholder,
-    "FX DESIGNER\n\n"
-    "• Choose line (0-3)\n"
-    "• Set pixel range\n"
-    "• Select effect type\n"
-    "• Pick colors or gradients\n"
-    "• Live preview on hardware\n\n"
-    "Create stunning effects!");
-  lv_obj_set_style_text_color(placeholder, lv_color_hex(GORE_DARK_RED), 0);
-  lv_obj_set_style_text_align(placeholder, LV_TEXT_ALIGN_CENTER, 0);
+                    "FX DESIGNER\n\n"
+                    "• Build gradients + chases\n"
+                    "• Assign to LED lines\n"
+                    "• Preview via ESP-NOW\n"
+                    "• Store in cue library");
+  lv_obj_set_style_text_color(placeholder, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_align(placeholder, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
   lv_obj_center(placeholder);
 
-  Serial.println("[UI] FX designer complete");
+  Serial.println("[UI] FX designer ready");
 }
 
 // ────────────────────────────────────────────────────────────────
-//  DEFERRED UI BUILD (IN LOOP)
+//  LIVE CONTROL SCREEN
+// ────────────────────────────────────────────────────────────────
+void create_live_control_screen() {
+  Serial.println("[UI] Building LIVE CONTROL desk...");
+
+  screen_live_control = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen_live_control, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
+  lv_obj_set_style_pad_hor(screen_live_control, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_ver(screen_live_control, 12, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(screen_live_control, LV_SCROLLBAR_MODE_OFF);
+
+  // Top bar
+  lv_obj_t *top_bar = lv_obj_create(screen_live_control);
+  lv_obj_set_size(top_bar, SCREEN_W - 32, 80);
+  lv_obj_align(top_bar, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_style_bg_color(top_bar, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+  lv_obj_set_style_border_width(top_bar, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(top_bar, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(top_bar, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(top_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_radius(top_bar, 12, LV_PART_MAIN);
+
+  lv_obj_t *title = lv_label_create(top_bar);
+  lv_label_set_text(title, "LIVE CONTROL");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+
+  live_mode_btn = lv_btn_create(top_bar);
+  lv_obj_set_size(live_mode_btn, 150, 50);
+  lv_obj_set_style_bg_color(live_mode_btn, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(live_mode_btn, lv_color_hex(GORE_RED), LV_PART_MAIN | LV_STATE_CHECKED);
+  lv_obj_set_style_border_width(live_mode_btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(live_mode_btn, 8, LV_PART_MAIN);
+  lv_obj_add_flag(live_mode_btn, LV_OBJ_FLAG_CHECKABLE);
+  lv_obj_add_event_cb(live_mode_btn, mode_toggle_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  live_mode_label = lv_label_create(live_mode_btn);
+  lv_label_set_text(live_mode_label, "MONITOR");
+  lv_obj_set_style_text_font(live_mode_label, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_center(live_mode_label);
+
+  lv_obj_t *pair_btn = lv_btn_create(top_bar);
+  lv_obj_set_size(pair_btn, 110, 50);
+  lv_obj_set_style_bg_color(pair_btn, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(pair_btn, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(pair_btn, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(pair_btn, 8, LV_PART_MAIN);
+  lv_obj_add_event_cb(pair_btn, pair_button_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *pair_label = lv_label_create(pair_btn);
+  lv_label_set_text(pair_label, LV_SYMBOL_REFRESH " PAIR");
+  lv_obj_set_style_text_font(pair_label, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_center(pair_label);
+
+  live_signal_label = lv_label_create(top_bar);
+  lv_label_set_text(live_signal_label, LV_SYMBOL_WIFI " NO LINK");
+  lv_obj_set_style_text_font(live_signal_label, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(live_signal_label, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_pad_left(live_signal_label, 16, LV_PART_MAIN);
+
+  live_peer_label = lv_label_create(top_bar);
+  lv_label_set_text(live_peer_label, "Waiting for Brain...");
+  lv_obj_set_style_text_font(live_peer_label, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(live_peer_label, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_pad_left(live_peer_label, 18, LV_PART_MAIN);
+
+  // Timeline panel
+  lv_obj_t *timeline_panel = lv_obj_create(screen_live_control);
+  lv_obj_align(timeline_panel, LV_ALIGN_TOP_LEFT, 0, 96);
+  lv_obj_set_size(timeline_panel, SCREEN_W - 32, 100);
+  lv_obj_set_style_bg_color(timeline_panel, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(timeline_panel, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(timeline_panel, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(timeline_panel, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(timeline_panel, 12, LV_PART_MAIN);
+
+  live_timeline_slider = lv_slider_create(timeline_panel);
+  lv_obj_set_size(live_timeline_slider, SCREEN_W - 56, 30);
+  lv_slider_set_range(live_timeline_slider, 0, TIMELINE_MAX_MS);
+  lv_obj_align(live_timeline_slider, LV_ALIGN_TOP_MID, 0, 4);
+  lv_obj_add_event_cb(live_timeline_slider, timeline_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_add_event_cb(live_timeline_slider, timeline_event_cb, LV_EVENT_RELEASED, nullptr);
+
+  live_timeline_label = lv_label_create(timeline_panel);
+  lv_obj_align(live_timeline_label, LV_ALIGN_BOTTOM_LEFT, 4, -4);
+  lv_label_set_text(live_timeline_label, "00:00.0");
+  lv_obj_set_style_text_font(live_timeline_label, &lv_font_montserrat_20, LV_PART_MAIN);
+
+  live_cue_label = lv_label_create(timeline_panel);
+  lv_obj_align(live_cue_label, LV_ALIGN_BOTTOM_RIGHT, -4, -4);
+  lv_label_set_text(live_cue_label, "Cue: --");
+  lv_obj_set_style_text_font(live_cue_label, &lv_font_montserrat_20, LV_PART_MAIN);
+
+  // Relay grid
+  lv_obj_t *relay_panel = lv_obj_create(screen_live_control);
+  lv_obj_set_size(relay_panel, SCREEN_W - 32, 150);
+  lv_obj_align(relay_panel, LV_ALIGN_TOP_LEFT, 0, 210);
+  lv_obj_set_style_bg_color(relay_panel, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(relay_panel, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(relay_panel, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(relay_panel, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(relay_panel, 10, LV_PART_MAIN);
+  lv_obj_set_flex_flow(relay_panel, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_flex_align(relay_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  for (int i = 0; i < 8; ++i) {
+    lv_obj_t *btn = lv_btn_create(relay_panel);
+    relayButtons[i] = btn;
+    lv_obj_set_size(btn, 160, 60);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(GORE_RED), LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_set_style_border_color(btn, lv_color_hex(GORE_RED), LV_PART_MAIN);
+    lv_obj_set_style_border_color(btn, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_set_style_border_width(btn, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 10, LV_PART_MAIN);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CHECKABLE);
+
+    char labelTxt[32];
+    snprintf(labelTxt, sizeof(labelTxt), "Relay %d", i + 1);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, labelTxt);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_18, LV_PART_MAIN);
+    lv_obj_center(label);
+
+    lv_obj_add_event_cb(btn, relay_event_cb, LV_EVENT_VALUE_CHANGED, &relayIdMap[i]);
+  }
+
+  // MP3 decks + LED controls container
+  lv_obj_t *lower_panel = lv_obj_create(screen_live_control);
+  lv_obj_set_size(lower_panel, SCREEN_W - 32, 180);
+  lv_obj_align(lower_panel, LV_ALIGN_BOTTOM_MID, 0, -90);
+  lv_obj_set_style_bg_color(lower_panel, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(lower_panel, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(lower_panel, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(lower_panel, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(lower_panel, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(lower_panel, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(lower_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+  auto build_mp3_deck = [&](uint8_t deckIndex, const char *titleText) {
+    lv_obj_t *deck = lv_obj_create(lower_panel);
+    lv_obj_set_size(deck, 200, 150);
+    lv_obj_set_style_bg_color(deck, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+    lv_obj_set_style_border_width(deck, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(deck, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(deck, 10, LV_PART_MAIN);
+    lv_obj_set_flex_flow(deck, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(deck, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    lv_obj_t *titleLbl = lv_label_create(deck);
+    lv_label_set_text(titleLbl, titleText);
+    lv_obj_set_style_text_font(titleLbl, &lv_font_montserrat_18, LV_PART_MAIN);
+    lv_obj_set_style_text_color(titleLbl, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+
+    lv_obj_t *volLbl = lv_label_create(deck);
+    lv_label_set_text(volLbl, "Volume");
+    lv_obj_set_style_text_font(volLbl, &lv_font_montserrat_16, LV_PART_MAIN);
+
+    mp3VolumeSlider[deckIndex] = lv_slider_create(deck);
+    lv_obj_set_width(mp3VolumeSlider[deckIndex], 180);
+    lv_slider_set_range(mp3VolumeSlider[deckIndex], 0, 255);
+    lv_obj_add_event_cb(mp3VolumeSlider[deckIndex], mp3_volume_event_cb, LV_EVENT_RELEASED, &mp3DeckMap[deckIndex]);
+
+    lv_obj_t *transportRow = lv_obj_create(deck);
+    lv_obj_set_size(transportRow, 180, 60);
+    lv_obj_set_style_bg_color(transportRow, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(transportRow, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(transportRow, 6, LV_PART_MAIN);
+    lv_obj_set_style_radius(transportRow, 8, LV_PART_MAIN);
+    lv_obj_set_flex_flow(transportRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(transportRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *playBtn = lv_btn_create(transportRow);
+    lv_obj_set_size(playBtn, 70, 40);
+    lv_obj_set_style_bg_color(playBtn, lv_color_hex(GORE_RED), LV_PART_MAIN);
+    lv_obj_set_style_border_width(playBtn, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(playBtn, 10, LV_PART_MAIN);
+    lv_obj_t *playLbl = lv_label_create(playBtn);
+    lv_label_set_text(playLbl, LV_SYMBOL_PLAY " PLAY");
+    lv_obj_center(playLbl);
+    mp3ButtonMeta[deckIndex * 2] = {deckIndex, MP3_ACT_PLAY};
+    lv_obj_add_event_cb(playBtn, mp3_transport_event_cb, LV_EVENT_CLICKED, &mp3ButtonMeta[deckIndex * 2]);
+
+    lv_obj_t *stopBtn = lv_btn_create(transportRow);
+    lv_obj_set_size(stopBtn, 70, 40);
+    lv_obj_set_style_bg_color(stopBtn, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+    lv_obj_set_style_border_width(stopBtn, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(stopBtn, 10, LV_PART_MAIN);
+    lv_obj_t *stopLbl = lv_label_create(stopBtn);
+    lv_label_set_text(stopLbl, LV_SYMBOL_STOP " STOP");
+    lv_obj_center(stopLbl);
+    mp3ButtonMeta[deckIndex * 2 + 1] = {deckIndex, MP3_ACT_STOP};
+    lv_obj_add_event_cb(stopBtn, mp3_transport_event_cb, LV_EVENT_CLICKED, &mp3ButtonMeta[deckIndex * 2 + 1]);
+
+    mp3StateLabel[deckIndex] = lv_label_create(deck);
+    lv_label_set_text(mp3StateLabel[deckIndex], "State: STOP");
+    lv_obj_set_style_text_font(mp3StateLabel[deckIndex], &lv_font_montserrat_16, LV_PART_MAIN);
+  };
+
+  build_mp3_deck(0, "MP3 DECK A");
+  build_mp3_deck(1, "MP3 DECK B");
+
+  lv_obj_t *ledPanel = lv_obj_create(lower_panel);
+  lv_obj_set_size(ledPanel, 200, 150);
+  lv_obj_set_style_bg_color(ledPanel, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+  lv_obj_set_style_border_width(ledPanel, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(ledPanel, 10, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(ledPanel, 10, LV_PART_MAIN);
+  lv_obj_set_flex_flow(ledPanel, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(ledPanel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+  lv_obj_t *ledTitle = lv_label_create(ledPanel);
+  lv_label_set_text(ledTitle, "LED LINES");
+  lv_obj_set_style_text_font(ledTitle, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ledTitle, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+
+  for (int i = 0; i < 4; ++i) {
+    ledSlider[i] = lv_slider_create(ledPanel);
+    lv_obj_set_width(ledSlider[i], 180);
+    lv_slider_set_range(ledSlider[i], 0, 65535);
+    lv_obj_add_event_cb(ledSlider[i], led_slider_event_cb, LV_EVENT_RELEASED, &ledLineMap[i]);
+
+    char lbl[24];
+    snprintf(lbl, sizeof(lbl), "Line %d", i + 1);
+    lv_obj_t *lineLbl = lv_label_create(ledPanel);
+    lv_label_set_text(lineLbl, lbl);
+    lv_obj_set_style_text_font(lineLbl, &lv_font_montserrat_14, LV_PART_MAIN);
+  }
+
+  // Toolbar
+  lv_obj_t *toolbar = lv_obj_create(screen_live_control);
+  lv_obj_set_size(toolbar, SCREEN_W - 32, 70);
+  lv_obj_align(toolbar, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_color(toolbar, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+  lv_obj_set_style_border_width(toolbar, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(toolbar, 10, LV_PART_MAIN);
+  lv_obj_set_style_radius(toolbar, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(toolbar, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(toolbar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  auto make_toolbar_btn = [&](const char *txt, CommandType type) {
+    lv_obj_t *btn = lv_btn_create(toolbar);
+    lv_obj_set_size(btn, 180, 50);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(GORE_RED), LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(btn, 10, LV_PART_MAIN);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, txt);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, toolbar_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)type);
+  };
+
+  make_toolbar_btn(LV_SYMBOL_STOP " STOP ALL", CMD_STOP_ALL);
+  make_toolbar_btn(LV_SYMBOL_PLAY " NEXT CUE", CMD_NEXT_CUE);
+  make_toolbar_btn(LV_SYMBOL_LEFT " PREV CUE", CMD_PREV_CUE);
+
+  Serial.println("[UI] LIVE CONTROL ready");
+}
+
+// ────────────────────────────────────────────────────────────────
+//  BUILDER HELPERS
+// ────────────────────────────────────────────────────────────────
+static void builder_attach_library_button(ShowEntry &entry) {
+  if (!builder_show_list) return;
+
+  entry.widget = lv_btn_create(builder_show_list);
+  lv_obj_set_size(entry.widget, LV_PCT(100), 60);
+  lv_obj_set_style_bg_color(entry.widget, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(entry.widget, lv_color_hex(GORE_RED), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_radius(entry.widget, 10, LV_PART_MAIN);
+  lv_obj_set_style_border_width(entry.widget, 0, LV_PART_MAIN);
+  lv_obj_add_flag(entry.widget, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+  lv_obj_add_event_cb(entry.widget, builder_show_item_event_cb, LV_EVENT_ALL, &entry);
+
+  lv_obj_t *label = lv_label_create(entry.widget);
+  lv_label_set_text(label, entry.name);
+  lv_obj_center(label);
+
+  entry.floating = false;
+  entry.dragOffsetX = 0;
+  entry.dragOffsetY = 0;
+}
+
+void builder_reset_show_item(ShowEntry *entry) {
+  if (!entry || !entry->widget) return;
+  if (builder_show_list) {
+    lv_obj_remove_flag(entry->widget, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_parent(entry->widget, builder_show_list);
+    lv_obj_set_size(entry->widget, LV_PCT(100), 60);
+    lv_obj_set_style_bg_color(entry->widget, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+    lv_obj_move_to_index(entry->widget, builderShowCount > 0 ? builderShowCount - 1 : 0);
+  }
+  entry->floating = false;
+}
+
+void builder_clear_workspace() {
+  for (size_t i = 0; i < builderClipCount; ++i) {
+    yield();
+    if (builderClips[i].widget) {
+      lv_obj_del(builderClips[i].widget);
+      builderClips[i].widget = nullptr;
+    }
+  }
+  builderClipCount = 0;
+  yield();
+}
+
+static bool builder_rect_overlap(const lv_area_t &a, const lv_area_t &b) {
+  if (a.x2 < b.x1) return false;
+  if (a.x1 > b.x2) return false;
+  if (a.y2 < b.y1) return false;
+  if (a.y1 > b.y2) return false;
+  return true;
+}
+
+void builder_add_clip(const char *name, uint32_t startMs, uint8_t lane) {
+  if (!builder_timeline_area) return;
+  if (builderClipCount >= MAX_BUILDER_CLIPS) {
+    if (builder_status_label) {
+      lv_label_set_text(builder_status_label, "Clip limit reached (64)");
+    }
+    show_toast("Clip limit reached – delete a clip to add more", 2500);
+    return;
+  }
+  yield();
+
+  BuilderClip &clip = builderClips[builderClipCount++];
+  memset(&clip, 0, sizeof(clip));
+  strncpy(clip.showName, name, sizeof(clip.showName) - 1);
+  clip.startMs = min(startMs, builderTimelineMs);
+  clip.lane = min<uint8_t>(lane, BUILDER_LANE_COUNT - 1);
+
+  lv_obj_t *widget = lv_obj_create(builder_timeline_area);
+  clip.widget = widget;
+  lv_obj_set_size(widget, BUILDER_CLIP_WIDTH, BUILDER_CLIP_HEIGHT);
+  lv_obj_set_style_bg_color(widget, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(widget, 8, LV_PART_MAIN);
+  lv_obj_set_style_border_color(widget, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(widget, 2, LV_PART_MAIN);
+  lv_obj_add_event_cb(widget, builder_clip_event_cb, LV_EVENT_CLICKED, &clip);
+
+  lv_obj_t *label = lv_label_create(widget);
+  lv_label_set_text(label, name);
+  lv_obj_center(label);
+
+  lv_coord_t innerWidth = lv_obj_get_width(builder_timeline_area) - BUILDER_CLIP_WIDTH - 20;
+  if (innerWidth < 1) innerWidth = 1;
+  lv_coord_t x = (lv_coord_t)((clip.startMs / (float)builderTimelineMs) * innerWidth);
+  lv_coord_t y = clip.lane * BUILDER_LANE_HEIGHT + 10;
+  lv_obj_set_pos(widget, x + 10, y);
+  yield();
+
+  if (builder_status_label) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Placed \"%s\" lane %u @ %lu ms", name,
+             static_cast<unsigned>(clip.lane + 1),
+             static_cast<unsigned long>(clip.startMs));
+    lv_label_set_text(builder_status_label, msg);
+  }
+  show_toast("Cue added to timeline");
+}
+
+void refresh_show_library() {
+  if (!builder_show_list) return;
+  lv_obj_clean(builder_show_list);
+  for (size_t i = 0; i < builderShowCount; ++i) {
+    builderShowEntries[i].widget = nullptr;
+    yield();
+  }
+
+  load_show_library_from_storage();
+
+  for (size_t i = 0; i < builderShowCount; ++i) {
+    ShowEntry &entry = builderShowEntries[i];
+    builder_attach_library_button(entry);
+    yield();
+  }
+
+  if (builder_status_label) {
+    lv_label_set_text(builder_status_label, "Drag cues into the timeline to build a show.");
+  }
+}
+
+void builder_show_item_event_cb(lv_event_t *e) {
+  ShowEntry *entry = static_cast<ShowEntry *>(lv_event_get_user_data(e));
+  if (!entry || !entry->widget) return;
+
+  lv_event_code_t code = lv_event_get_code(e);
+  lv_indev_t *indev = lv_indev_get_act();
+
+  if (code == LV_EVENT_PRESSED && indev) {
+    lv_area_t coords;
+    lv_obj_get_coords(entry->widget, &coords);
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+    entry->homeX = coords.x1;
+    entry->homeY = coords.y1;
+    entry->dragOffsetX = point.x - coords.x1;
+    entry->dragOffsetY = point.y - coords.y1;
+    lv_obj_set_parent(entry->widget, screen_builder);
+    lv_obj_add_flag(entry->widget, LV_OBJ_FLAG_FLOATING);
+    lv_obj_move_foreground(entry->widget);
+    lv_obj_set_size(entry->widget, BUILDER_CLIP_WIDTH, BUILDER_CLIP_HEIGHT);
+    entry->floating = true;
+    yield();
+  } else if (code == LV_EVENT_PRESSING && indev && entry->floating) {
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+    lv_coord_t newX = point.x - entry->dragOffsetX;
+    lv_coord_t newY = point.y - entry->dragOffsetY;
+    lv_obj_set_pos(entry->widget, newX, newY);
+    yield();
+  } else if ((code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST || code == LV_EVENT_DRAG_END) && entry->floating) {
+    bool dropped = false;
+    if (builder_timeline_area) {
+      lv_area_t itemArea;
+      lv_area_t timelineArea;
+      lv_obj_get_coords(entry->widget, &itemArea);
+      lv_obj_get_coords(builder_timeline_area, &timelineArea);
+        if (builder_rect_overlap(itemArea, timelineArea)) {
+          lv_coord_t timelineWidth = lv_obj_get_width(builder_timeline_area);
+          lv_coord_t timelineSpan = timelineWidth - BUILDER_CLIP_WIDTH - 20;
+          if (timelineSpan < 1) timelineSpan = 1;
+          lv_coord_t relX = itemArea.x1 - (timelineArea.x1 + 10);
+          lv_coord_t relY = itemArea.y1 - (timelineArea.y1 + 10);
+          if (relX < 0) relX = 0;
+          if (relX > timelineSpan) relX = timelineSpan;
+          if (relY < 0) relY = 0;
+
+          uint32_t startMs = (uint32_t)((relX / (float)timelineSpan) * builderTimelineMs);
+          uint8_t lane = static_cast<uint8_t>(relY / BUILDER_LANE_HEIGHT);
+          if (lane >= BUILDER_LANE_COUNT) lane = BUILDER_LANE_COUNT - 1;
+          builder_add_clip(entry->name, startMs, lane);
+          dropped = true;
+        }
+    }
+    builder_reset_show_item(entry);
+    if (!dropped) {
+      if (builder_status_label) {
+        lv_label_set_text(builder_status_label, "Cue returned to library.");
+      }
+      show_toast("Cue returned to library");
+    }
+    yield();
+  }
+}
+
+void builder_clip_event_cb(lv_event_t *e) {
+  BuilderClip *clip = static_cast<BuilderClip *>(lv_event_get_user_data(e));
+  if (!clip || !builder_status_label) return;
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Clip \"%s\" lane %u @ %lu ms",
+             clip->showName,
+             static_cast<unsigned>(clip->lane + 1),
+             static_cast<unsigned long>(clip->startMs));
+    lv_label_set_text(builder_status_label, msg);
+  }
+}
+
+void builder_clear_event_cb(lv_event_t *e) {
+  (void)e;
+  builder_clear_workspace();
+  if (builder_status_label) {
+    lv_label_set_text(builder_status_label, "Workspace cleared.");
+  }
+  show_toast("Builder workspace cleared");
+}
+
+void builder_save_event_cb(lv_event_t *e) {
+  (void)e;
+  if (!builder_name_field || !builder_status_label) return;
+
+  const char *name = lv_textarea_get_text(builder_name_field);
+  if (!name || strlen(name) == 0) {
+    lv_label_set_text(builder_status_label, "Enter a show name before saving.");
+    show_toast("Enter a show name before saving");
+    return;
+  }
+
+  if (builderClipCount == 0) {
+    lv_label_set_text(builder_status_label, "Add at least one clip before saving.");
+    show_toast("Builder needs at least one cue before saving");
+    return;
+  }
+
+  if (save_builder_to_storage(name)) {
+    load_show_library_from_storage();
+    refresh_show_library();
+    lv_label_set_text(builder_status_label, "Show saved to SD card.");
+    show_toast("Show arrangement saved to SD card");
+    detach_keyboard();
+  } else {
+    lv_label_set_text(builder_status_label, "Failed to write show to SD card.");
+    show_toast("Failed to save show – check SD card", 3000);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+//  ADD-ONS REGISTRY & UI
+// ────────────────────────────────────────────────────────────────
+
+static void addon_build_smoke(AddonCardContext *ctx);
+static void addon_build_pixels(AddonCardContext *ctx);
+static void addon_build_relay(AddonCardContext *ctx);
+static void addon_build_mp3(AddonCardContext *ctx);
+static void addon_build_r3(AddonCardContext *ctx);
+static void addon_refresh_pixels(AddonCardContext *ctx, const ShowduinoStatus &status);
+static void addon_refresh_relay(AddonCardContext *ctx, const ShowduinoStatus &status);
+static void addon_refresh_mp3(AddonCardContext *ctx, const ShowduinoStatus &status);
+static void addon_refresh_noop(AddonCardContext *, const ShowduinoStatus &) {}
+
+static const AddonDefinition addonDefinitions[] = {
+  {"Smoke Control", "Mechanical", 10, addon_build_smoke, addon_refresh_noop, 0x2A, true},
+  {"NeoPixel Lines", "Lighting", 11, addon_build_pixels, addon_refresh_pixels, 0x00, false},
+  {"Relay Expander", "Mechanical", 12, addon_build_relay, addon_refresh_relay, 0x3E, true},
+  {"MP3 Player A/B", "Audio", 13, addon_build_mp3, addon_refresh_mp3, 0x00, false},
+  {"R3 Terminal FX", "Prop FX", 14, addon_build_r3, addon_refresh_noop, 0x41, true}
+};
+static constexpr size_t addonDefinitionCount = sizeof(addonDefinitions) / sizeof(AddonDefinition);
+
+void addon_slider_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  auto *payload = static_cast<AddonEventPayload *>(lv_event_get_user_data(e));
+  if (!payload || !payload->ctx) return;
+  if (payload->ctx->updating) return;
+  lv_obj_t *slider = lv_event_get_target(e);
+  uint16_t value = lv_slider_get_value(slider);
+  yield();
+  if (payload->action == ADDON_PIXELS_BRIGHTNESS) {
+    uint16_t startPix = 0;
+    uint16_t lengthPix = ADDON_PIXELS_PER_LINE;
+    if (payload->ctx->controls.spinStart && payload->ctx->controls.spinLength) {
+      startPix = lv_spinbox_get_value(payload->ctx->controls.spinStart);
+      lengthPix = lv_spinbox_get_value(payload->ctx->controls.spinLength);
+    }
+    startPix = constrain(startPix, (uint16_t)0, (uint16_t)(ADDON_PIXELS_PER_LINE - 1));
+    lengthPix = constrain(lengthPix, (uint16_t)1, (uint16_t)ADDON_PIXELS_PER_LINE);
+    uint8_t line = payload->ctx->currentLine;
+    if (payload->ctx->controls.lineDropdown) {
+      line = lv_dropdown_get_selected(payload->ctx->controls.lineDropdown);
+      payload->ctx->currentLine = line;
+    }
+    if (ADDON_PIXEL_LINES > 0) {
+      line = line % ADDON_PIXEL_LINES;
+    } else {
+      line = 0;
+    }
+    uint16_t packed = ((line & 0x03) << 14) |
+                      ((startPix & 0x7F) << 7) |
+                      (lengthPix & 0x7F);
+    send_addon_action(payload->ctx->addonId, payload->action, value, packed);
+  } else {
+    send_addon_action(payload->ctx->addonId, payload->action, value, payload->aux);
+  }
+}
+
+void addon_button_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  auto *payload = static_cast<AddonEventPayload *>(lv_event_get_user_data(e));
+  if (!payload || !payload->ctx) return;
+  uint16_t param = payload->aux;
+  if (payload->action == ADDON_SMOKE_TRIGGER && payload->ctx->controls.sliderPrimary) {
+    param = lv_slider_get_value(payload->ctx->controls.sliderPrimary);
+  }
+  yield();
+  send_addon_action(payload->ctx->addonId, payload->action, param, payload->aux);
+}
+
+void addon_dropdown_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  auto *payload = static_cast<AddonEventPayload *>(lv_event_get_user_data(e));
+  if (!payload || !payload->ctx) return;
+  lv_obj_t *dd = lv_event_get_target(e);
+  uint16_t selected = lv_dropdown_get_selected(dd);
+  yield();
+  if (payload->action == ADDON_PIXELS_EFFECT) {
+    uint16_t startPix = 0;
+    uint16_t lengthPix = ADDON_PIXELS_PER_LINE;
+    if (payload->ctx->controls.spinStart && payload->ctx->controls.spinLength) {
+      startPix = lv_spinbox_get_value(payload->ctx->controls.spinStart);
+      lengthPix = lv_spinbox_get_value(payload->ctx->controls.spinLength);
+    }
+    startPix = constrain(startPix, (uint16_t)0, (uint16_t)(ADDON_PIXELS_PER_LINE - 1));
+    lengthPix = constrain(lengthPix, (uint16_t)1, (uint16_t)ADDON_PIXELS_PER_LINE);
+    uint8_t line = payload->ctx->currentLine;
+    if (payload->ctx->controls.lineDropdown) {
+      line = lv_dropdown_get_selected(payload->ctx->controls.lineDropdown);
+      payload->ctx->currentLine = line;
+    }
+    if (ADDON_PIXEL_LINES > 0) {
+      line = line % ADDON_PIXEL_LINES;
+    } else {
+      line = 0;
+    }
+    uint16_t packed = ((line & 0x03) << 14) |
+                      ((startPix & 0x7F) << 7) |
+                      (lengthPix & 0x7F);
+    send_addon_action(payload->ctx->addonId, payload->action, selected, packed);
+  } else {
+    send_addon_action(payload->ctx->addonId, payload->action, selected, payload->aux);
+  }
+}
+
+void addon_line_dropdown_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  auto *ctx = static_cast<AddonCardContext *>(lv_event_get_user_data(e));
+  if (!ctx) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (ADDON_PIXEL_LINES > 0) {
+    ctx->currentLine = selected % ADDON_PIXEL_LINES;
+  } else {
+    ctx->currentLine = 0;
+  }
+  yield();
+  addon_refresh_pixels(ctx, latestStatus);
+}
+
+void addon_group_dropdown_event_cb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  auto *ctx = static_cast<AddonCardContext *>(lv_event_get_user_data(e));
+  if (!ctx) return;
+  if (!ctx->controls.spinStart || !ctx->controls.spinLength) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (selected == 0) {
+    lv_spinbox_set_value(ctx->controls.spinStart, 0);
+    lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXELS_PER_LINE);
+  } else if (selected == 1) {
+    lv_spinbox_set_value(ctx->controls.spinStart, 0);
+    lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXELS_PER_LINE / 2);
+  } else if (selected == 2) {
+    lv_spinbox_set_value(ctx->controls.spinStart, ADDON_PIXELS_PER_LINE / 2);
+    lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXELS_PER_LINE / 2);
+  }
+  yield();
+}
+
+static void addon_create_header(AddonCardContext *ctx) {
+  lv_obj_t *title = lv_label_create(ctx->card);
+  lv_label_set_text_fmt(title, "%s\n(%s)", ctx->def->name, ctx->def->category);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+  yield();
+}
+
+static AddonEventPayload *addon_make_payload(AddonCardContext *ctx, uint8_t action, uint16_t aux = 0) {
+  auto *payload = static_cast<AddonEventPayload *>(lv_mem_alloc(sizeof(AddonEventPayload)));
+  if (!payload) return nullptr;
+  payload->ctx = ctx;
+  payload->action = action;
+  payload->aux = aux;
+  return payload;
+}
+
+static void addon_build_smoke(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+  lv_obj_t *slider = lv_slider_create(ctx->card);
+  lv_slider_set_range(slider, 0, 255);
+  ctx->controls.sliderPrimary = slider;
+  if (auto payload = addon_make_payload(ctx, ADDON_SMOKE_INTENSITY)) {
+    lv_obj_add_event_cb(slider, addon_slider_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  lv_obj_t *btnBurst = lv_btn_create(ctx->card);
+  lv_obj_set_width(btnBurst, LV_PCT(100));
+  lv_obj_t *burstLabel = lv_label_create(btnBurst);
+  lv_label_set_text(burstLabel, "Burst 3s");
+  lv_obj_center(burstLabel);
+  if (auto payload = addon_make_payload(ctx, ADDON_SMOKE_TRIGGER)) {
+    lv_obj_add_event_cb(btnBurst, addon_button_event_cb, LV_EVENT_CLICKED, payload);
+  }
+  yield();
+
+  lv_obj_t *btnPurge = lv_btn_create(ctx->card);
+  lv_obj_set_width(btnPurge, LV_PCT(100));
+  lv_obj_t *purgeLabel = lv_label_create(btnPurge);
+  lv_label_set_text(purgeLabel, "Purge/Vent");
+  lv_obj_center(purgeLabel);
+  if (auto payload = addon_make_payload(ctx, ADDON_SMOKE_PURGE)) {
+    lv_obj_add_event_cb(btnPurge, addon_button_event_cb, LV_EVENT_CLICKED, payload);
+  }
+  yield();
+}
+
+static void addon_build_pixels(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+  ctx->currentLine = 0;
+
+  lv_obj_t *lineLabel = lv_label_create(ctx->card);
+  lv_label_set_text(lineLabel, "Line");
+  lv_obj_set_style_text_color(lineLabel, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  yield();
+
+  lv_obj_t *lineDrop = lv_dropdown_create(ctx->card);
+  lv_dropdown_set_options(lineDrop, "Line 1\nLine 2\nLine 3\nLine 4");
+  lv_dropdown_set_selected(lineDrop, 0);
+  ctx->controls.lineDropdown = lineDrop;
+  lv_obj_add_event_cb(lineDrop, addon_line_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, ctx);
+  yield();
+
+  lv_obj_t *groupLabel = lv_label_create(ctx->card);
+  lv_label_set_text(groupLabel, "Group");
+  lv_obj_set_style_text_color(groupLabel, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  yield();
+
+  lv_obj_t *groupDrop = lv_dropdown_create(ctx->card);
+  lv_dropdown_set_options(groupDrop, "Full Line\nPixels 0-59\nPixels 60-119\nCustom");
+  ctx->controls.groupDropdown = groupDrop;
+  lv_obj_add_event_cb(groupDrop, addon_group_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, ctx);
+  yield();
+
+  lv_obj_t *slider = lv_slider_create(ctx->card);
+  lv_slider_set_range(slider, 0, 255);
+  ctx->controls.sliderPrimary = slider;
+  if (auto payload = addon_make_payload(ctx, ADDON_PIXELS_BRIGHTNESS, 0)) {
+    lv_obj_add_event_cb(slider, addon_slider_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  lv_obj_t *effect = lv_dropdown_create(ctx->card);
+  lv_dropdown_set_options(effect, "Solid\nFlash\nChase\nTwinkle\nGradient\nWave");
+  ctx->controls.dropdown = effect;
+  if (auto payload = addon_make_payload(ctx, ADDON_PIXELS_EFFECT)) {
+    lv_obj_add_event_cb(effect, addon_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  lv_obj_t *rangeContainer = lv_obj_create(ctx->card);
+  lv_obj_set_style_bg_opa(rangeContainer, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_flex_flow(rangeContainer, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_all(rangeContainer, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_column(rangeContainer, 8, LV_PART_MAIN);
+  ctx->controls.spinStart = lv_spinbox_create(rangeContainer);
+  lv_spinbox_set_range(ctx->controls.spinStart, 0, ADDON_PIXELS_PER_LINE - 1);
+  lv_spinbox_set_step(ctx->controls.spinStart, 1);
+  lv_spinbox_set_value(ctx->controls.spinStart, 0);
+
+  ctx->controls.spinLength = lv_spinbox_create(rangeContainer);
+  lv_spinbox_set_range(ctx->controls.spinLength, 1, ADDON_PIXELS_PER_LINE);
+  lv_spinbox_set_step(ctx->controls.spinLength, 1);
+  lv_spinbox_set_value(ctx->controls.spinLength, ADDON_PIXELS_PER_LINE);
+  yield();
+
+  ctx->controls.statusLabel = lv_label_create(ctx->card);
+  lv_label_set_text(ctx->controls.statusLabel, "No active groups");
+  lv_obj_set_style_text_color(ctx->controls.statusLabel, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+  yield();
+}
+
+static void addon_build_relay(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+  lv_obj_t *grid = lv_obj_create(ctx->card);
+  lv_obj_set_size(grid, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_style_pad_column(grid, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(grid, 6, LV_PART_MAIN);
+  yield();
+
+  for (uint8_t i = 0; i < 8 && i < 16; ++i) {
+    lv_obj_t *btn = lv_btn_create(grid);
+    lv_obj_set_size(btn, 120, 50);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text_fmt(lbl, "Relay %u", static_cast<unsigned>(i + 1));
+    lv_obj_center(lbl);
+    ctx->controls.toggleButtons[i] = btn;
+    if (auto payload = addon_make_payload(ctx, ADDON_RELAY_TOGGLE_BASE + i)) {
+      lv_obj_add_event_cb(btn, addon_button_event_cb, LV_EVENT_CLICKED, payload);
+    }
+    yield();
+  }
+}
+
+static void addon_build_mp3(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+
+  lv_obj_t *volumeALabel = lv_label_create(ctx->card);
+  lv_label_set_text(volumeALabel, "Deck A Volume");
+  lv_obj_set_style_text_color(volumeALabel, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  yield();
+
+  lv_obj_t *sliderA = lv_slider_create(ctx->card);
+  lv_slider_set_range(sliderA, 0, 255);
+  ctx->controls.sliderPrimary = sliderA;
+  if (auto payload = addon_make_payload(ctx, ADDON_MP3_VOLUME_A, 0)) {
+    lv_obj_add_event_cb(sliderA, addon_slider_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  lv_obj_t *volumeBLabel = lv_label_create(ctx->card);
+  lv_label_set_text(volumeBLabel, "Deck B Volume");
+  lv_obj_set_style_text_color(volumeBLabel, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  yield();
+
+  lv_obj_t *sliderB = lv_slider_create(ctx->card);
+  lv_slider_set_range(sliderB, 0, 255);
+  ctx->controls.sliderSecondary = sliderB;
+  if (auto payload = addon_make_payload(ctx, ADDON_MP3_VOLUME_B, 1)) {
+    lv_obj_add_event_cb(sliderB, addon_slider_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+
+  auto makeMp3Button = [&](const char *text, uint8_t action, uint16_t aux) {
+    lv_obj_t *btn = lv_btn_create(ctx->card);
+    lv_obj_set_size(btn, LV_PCT(100), 44);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_center(lbl);
+    if (auto payload = addon_make_payload(ctx, action, aux)) {
+      lv_obj_add_event_cb(btn, addon_button_event_cb, LV_EVENT_CLICKED, payload);
+    }
+    yield();
+  };
+
+  makeMp3Button("Play Deck A", ADDON_MP3_PLAY, 0);
+  makeMp3Button("Stop Deck A", ADDON_MP3_STOP, 0);
+  makeMp3Button("Play Deck B", ADDON_MP3_PLAY, 1);
+  makeMp3Button("Stop Deck B", ADDON_MP3_STOP, 1);
+  makeMp3Button("Sync Library", ADDON_MP3_SYNC, 0);
+}
+
+static void addon_build_r3(AddonCardContext *ctx) {
+  addon_create_header(ctx);
+  lv_obj_t *dropdown = lv_dropdown_create(ctx->card);
+  lv_dropdown_set_options(dropdown, "Glitch\nShock\nTime Flicker\nFade Out");
+  ctx->controls.dropdown = dropdown;
+  if (auto payload = addon_make_payload(ctx, ADDON_R3_PRESET)) {
+    lv_obj_add_event_cb(dropdown, addon_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, payload);
+  }
+  yield();
+}
+
+static void addon_refresh_pixels(AddonCardContext *ctx, const ShowduinoStatus &status) {
+  if (!ctx || !ctx->controls.sliderPrimary) return;
+  ctx->updating = true;
+  uint8_t line = ctx->currentLine;
+  if (ctx->controls.lineDropdown) {
+    line = lv_dropdown_get_selected(ctx->controls.lineDropdown);
+    ctx->currentLine = line;
+  }
+  if (ADDON_PIXEL_LINES > 0) {
+    line = line % ADDON_PIXEL_LINES;
+  } else {
+    line = 0;
+  }
+  uint16_t value = status.ledBrightness[line];
+  if (value > 255) value = 255;
+  lv_slider_set_value(ctx->controls.sliderPrimary, value, LV_ANIM_OFF);
+  if (ctx->controls.statusLabel) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Groups L1:%3u L2:%3u L3:%3u L4:%3u",
+             status.ledBrightness[0], status.ledBrightness[1],
+             status.ledBrightness[2], status.ledBrightness[3]);
+    lv_label_set_text(ctx->controls.statusLabel, buf);
+  }
+  ctx->updating = false;
+  yield();
+}
+
+static void addon_refresh_relay(AddonCardContext *ctx, const ShowduinoStatus &status) {
+  if (!ctx) return;
+  for (uint8_t i = 0; i < 8; ++i) {
+    lv_obj_t *btn = ctx->controls.toggleButtons[i];
+    if (!btn) continue;
+    if (status.relays[i]) {
+      lv_obj_add_state(btn, LV_STATE_CHECKED);
+    } else {
+      lv_obj_clear_state(btn, LV_STATE_CHECKED);
+    }
+    yield();
+  }
+}
+
+static void addon_refresh_mp3(AddonCardContext *ctx, const ShowduinoStatus &status) {
+  if (!ctx) return;
+  ctx->updating = true;
+  if (ctx->controls.sliderPrimary) {
+    lv_slider_set_value(ctx->controls.sliderPrimary, status.mp3Vol[0], LV_ANIM_OFF);
+  }
+  if (ctx->controls.sliderSecondary) {
+    lv_slider_set_value(ctx->controls.sliderSecondary, status.mp3Vol[1], LV_ANIM_OFF);
+  }
+  ctx->updating = false;
+  yield();
+}
+
+void create_addons_screen() {
+  Serial.println("[UI] Creating add-ons library...");
+  yield();
+
+  update_addon_availability();
+
+  screen_addons = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen_addons, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(screen_addons, 16, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(screen_addons, LV_SCROLLBAR_MODE_AUTO);
+  yield();
+
+  lv_obj_t *header = lv_label_create(screen_addons);
+  lv_label_set_text(header, LV_SYMBOL_LIST " ADD-ONS");
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_26, LV_PART_MAIN);
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_align(header, LV_ALIGN_TOP_LEFT, 10, 10);
+  yield();
+
+  lv_obj_t *btn_back = lv_btn_create(screen_addons);
+  lv_obj_set_size(btn_back, 110, 48);
+  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -10, 6);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn_back, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_back, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_back, settings_back_event_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *label_back = lv_label_create(btn_back);
+  lv_label_set_text(label_back, LV_SYMBOL_LEFT " BACK");
+  lv_obj_center(label_back);
+  yield();
+
+  lv_obj_t *grid = lv_obj_create(screen_addons);
+  lv_obj_set_size(grid, SCREEN_W - 32, SCREEN_H - 150);
+  lv_obj_align(grid, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_color(grid, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(grid, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(grid, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(grid, 16, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(grid, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(grid, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_column(grid, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  yield();
+
+  addonCardCount = 0;
+  int availableCount = 0;
+
+  for (size_t i = 0; i < addonDefinitionCount && addonCardCount < MAX_ADDONS; ++i) {
+    const AddonDefinition *def = &addonDefinitions[i];
+    bool available = (i < MAX_ADDONS) ? addonAvailable[i] : addon_is_available(def);
+    if (!available) continue;
+    availableCount++;
+    AddonCardContext *ctx = &addonCardContexts[addonCardCount++];
+    memset(ctx, 0, sizeof(AddonCardContext));
+    ctx->def = def;
+    ctx->addonId = def->id;
+
+    lv_obj_t *card = lv_obj_create(grid);
+    ctx->card = card;
+    lv_obj_set_size(card, (SCREEN_W - 80) / 2, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(GORE_RED), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    yield();
+
+    if (def->buildFn) {
+      def->buildFn(ctx);
+    }
+    yield();
+  }
+
+  if (availableCount == 0) {
+    lv_obj_t *msg = lv_label_create(grid);
+    lv_label_set_text(msg,
+                      "No compatible add-ons detected.\n"
+                      "Connect hardware and rescan (power cycle).");
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_18, LV_PART_MAIN);
+    lv_obj_center(msg);
+    yield();
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+//  SETTINGS SCREEN
+// ────────────────────────────────────────────────────────────────
+void create_settings_screen() {
+  Serial.println("[UI] Creating settings screen...");
+  yield();
+
+  screen_settings = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen_settings, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(screen_settings, 16, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(screen_settings, LV_SCROLLBAR_MODE_AUTO);
+  yield();
+
+  lv_obj_t *header = lv_label_create(screen_settings);
+  lv_label_set_text(header, LV_SYMBOL_SETTINGS " SETTINGS & LINK");
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_26, LV_PART_MAIN);
+  lv_obj_align(header, LV_ALIGN_TOP_LEFT, 10, 10);
+  yield();
+
+  lv_obj_t *btn_back = lv_btn_create(screen_settings);
+  lv_obj_set_size(btn_back, 110, 48);
+  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -10, 6);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn_back, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_back, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_back, settings_back_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *label_back = lv_label_create(btn_back);
+  lv_label_set_text(label_back, LV_SYMBOL_LEFT " BACK");
+  lv_obj_center(label_back);
+
+  lv_obj_t *content = lv_obj_create(screen_settings);
+  lv_obj_set_size(content, SCREEN_W - 32, SCREEN_H - 120);
+  lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_color(content, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(content, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(content, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(content, 18, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(content, 16, LV_PART_MAIN);
+  lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_row(content, 20, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(content, LV_DIR_VER);
+
+  auto make_card = [](lv_obj_t *parent) {
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_size(card, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, 14, LV_PART_MAIN);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(card, 8, LV_PART_MAIN);
+    return card;
+  };
+
+  // Brightness card
+  lv_obj_t *brightness_card = make_card(content);
+  lv_obj_t *brightness_row = lv_obj_create(brightness_card);
+  lv_obj_set_size(brightness_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(brightness_row, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(brightness_row, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(brightness_row, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(brightness_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(brightness_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *brightness_title = lv_label_create(brightness_row);
+  lv_label_set_text(brightness_title, "Display Brightness");
+  lv_obj_set_style_text_font(brightness_title, &lv_font_montserrat_20, LV_PART_MAIN);
+
+  settings_brightness_value = lv_label_create(brightness_row);
+  lv_obj_set_style_text_font(settings_brightness_value, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_brightness_slider = lv_slider_create(brightness_card);
+  lv_obj_set_width(settings_brightness_slider, LV_PCT(100));
+  lv_slider_set_range(settings_brightness_slider, 10, 255);
+  lv_slider_set_value(settings_brightness_slider, displayBrightness, LV_ANIM_OFF);
+  lv_obj_add_event_cb(settings_brightness_slider, settings_brightness_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *brightness_hint = lv_label_create(brightness_card);
+  lv_label_set_text(brightness_hint, "Adjust TFT backlight intensity. Lower for dark FOH booths.");
+  lv_obj_set_style_text_font(brightness_hint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(brightness_hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  // Autopair card
+  lv_obj_t *pair_card = make_card(content);
+  lv_obj_t *pair_row = lv_obj_create(pair_card);
+  lv_obj_set_size(pair_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(pair_row, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(pair_row, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(pair_row, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(pair_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(pair_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *pair_title = lv_label_create(pair_row);
+  lv_label_set_text(pair_title, "Brain Auto-Pair");
+  lv_obj_set_style_text_font(pair_title, &lv_font_montserrat_20, LV_PART_MAIN);
+
+  settings_autopair_switch = lv_switch_create(pair_row);
+  if (autoPairEnabled) {
+    lv_obj_add_state(settings_autopair_switch, LV_STATE_CHECKED);
+  } else {
+    lv_obj_clear_state(settings_autopair_switch, LV_STATE_CHECKED);
+  }
+  lv_obj_add_event_cb(settings_autopair_switch, settings_autopair_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  settings_autopair_label = lv_label_create(pair_card);
+  lv_obj_set_style_text_font(settings_autopair_label, &lv_font_montserrat_16, LV_PART_MAIN);
+
+  lv_obj_t *pair_hint = lv_label_create(pair_card);
+  lv_label_set_text(pair_hint, "When enabled, the desk locks to the first Brain broadcasting status packets.");
+  lv_obj_set_style_text_font(pair_hint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(pair_hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  // TX power card
+  lv_obj_t *power_card = make_card(content);
+  lv_obj_t *power_row = lv_obj_create(power_card);
+  lv_obj_set_size(power_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(power_row, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(power_row, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(power_row, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(power_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(power_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *power_title = lv_label_create(power_row);
+  lv_label_set_text(power_title, "ESP-NOW TX Power");
+  lv_obj_set_style_text_font(power_title, &lv_font_montserrat_20, LV_PART_MAIN);
+
+  settings_txpower_value = lv_label_create(power_row);
+  lv_obj_set_style_text_font(settings_txpower_value, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_txpower_slider = lv_slider_create(power_card);
+  lv_obj_set_width(settings_txpower_slider, LV_PCT(100));
+  lv_slider_set_range(settings_txpower_slider, 8, 78);
+  lv_slider_set_value(settings_txpower_slider, currentTxPower, LV_ANIM_OFF);
+  lv_obj_add_event_cb(settings_txpower_slider, settings_txpower_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *power_hint = lv_label_create(power_card);
+  lv_label_set_text(power_hint, "Set RF output (dBm * 4). Reduce for short-range rehearsals to minimise noise.");
+  lv_obj_set_style_text_font(power_hint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(power_hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  // Link status card
+  lv_obj_t *status_card = make_card(content);
+
+  settings_channel_label = lv_label_create(status_card);
+  lv_obj_set_style_text_font(settings_channel_label, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_peer_label = lv_label_create(status_card);
+  lv_obj_set_style_text_font(settings_peer_label, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_last_status_label = lv_label_create(status_card);
+  lv_obj_set_style_text_font(settings_last_status_label, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  settings_ping_label = lv_label_create(status_card);
+  lv_obj_set_style_text_font(settings_ping_label, &lv_font_montserrat_18, LV_PART_MAIN);
+
+  lv_obj_t *ping_btn = lv_btn_create(status_card);
+  lv_obj_set_size(ping_btn, 180, 50);
+  lv_obj_set_style_bg_color(ping_btn, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(ping_btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(ping_btn, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(ping_btn, settings_ping_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *ping_label = lv_label_create(ping_btn);
+  lv_label_set_text(ping_label, LV_SYMBOL_REFRESH " PING BRAIN");
+  lv_obj_center(ping_label);
+
+  lv_obj_t *status_hint = lv_label_create(status_card);
+  lv_label_set_text(status_hint, "Ping measures round-trip time against the next status frame from the Brain.");
+  lv_obj_set_style_text_font(status_hint, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(status_hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  update_settings_telemetry();
+  apply_display_brightness(displayBrightness);
+
+  Serial.println("[UI] Settings screen ready");
+}
+
+// ────────────────────────────────────────────────────────────────
+//  DIAGNOSTICS SCREEN
+// ────────────────────────────────────────────────────────────────
+void create_diagnostics_screen() {
+  Serial.println("[UI] Creating diagnostics screen...");
+
+  screen_diagnostics = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen_diagnostics, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(screen_diagnostics, 16, LV_PART_MAIN);
+
+  lv_obj_t *header = lv_label_create(screen_diagnostics);
+  lv_label_set_text(header, LV_SYMBOL_LIST " LIVE DIAGNOSTICS");
+  lv_obj_set_style_text_color(header, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_text_font(header, &lv_font_montserrat_26, LV_PART_MAIN);
+  lv_obj_align(header, LV_ALIGN_TOP_LEFT, 10, 10);
+
+  lv_obj_t *btn_back = lv_btn_create(screen_diagnostics);
+  lv_obj_set_size(btn_back, 110, 48);
+  lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -10, 6);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn_back, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_back, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_back, diagnostics_back_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *label_back = lv_label_create(btn_back);
+  lv_label_set_text(label_back, LV_SYMBOL_LEFT " BACK");
+  lv_obj_center(label_back);
+
+  lv_obj_t *content = lv_obj_create(screen_diagnostics);
+  lv_obj_set_size(content, SCREEN_W - 32, SCREEN_H - 120);
+  lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_color(content, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(content, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(content, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(content, 18, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(content, 18, LV_PART_MAIN);
+  lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_row(content, 18, LV_PART_MAIN);
+
+  auto make_row = [](lv_obj_t *parent, const char *title, lv_obj_t **valueLabel) {
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *label = lv_label_create(row);
+    lv_label_set_text(label, title);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, LV_PART_MAIN);
+
+    *valueLabel = lv_label_create(row);
+    lv_obj_set_style_text_font(*valueLabel, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(*valueLabel, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+
+    return row;
+  };
+
+  make_row(content, "Mode", &diag_mode_label);
+  make_row(content, "Relays", &diag_relay_label);
+  make_row(content, "MP3 Decks", &diag_mp3_label);
+  make_row(content, "LED Lines", &diag_led_label);
+  make_row(content, "Timeline", &diag_timeline_label);
+  make_row(content, "Last Status", &diag_last_update_label);
+
+  lv_obj_t *button_row = lv_obj_create(content);
+  lv_obj_set_size(button_row, LV_PCT(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(button_row, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(button_row, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(button_row, 0, LV_PART_MAIN);
+  lv_obj_set_flex_flow(button_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(button_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(button_row, 16, LV_PART_MAIN);
+
+  lv_obj_t *btn_ping = lv_btn_create(button_row);
+  lv_obj_set_size(btn_ping, 180, 50);
+  lv_obj_set_style_bg_color(btn_ping, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_ping, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_ping, settings_ping_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *btn_ping_label = lv_label_create(btn_ping);
+  lv_label_set_text(btn_ping_label, LV_SYMBOL_REFRESH " PING BRAIN");
+  lv_obj_center(btn_ping_label);
+
+  lv_obj_t *btn_resync = lv_btn_create(button_row);
+  lv_obj_set_size(btn_resync, 200, 50);
+  lv_obj_set_style_bg_color(btn_resync, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_resync, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_resync, pair_button_event_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *btn_resync_label = lv_label_create(btn_resync);
+  lv_label_set_text(btn_resync_label, LV_SYMBOL_REFRESH " FORCE RE-PAIR");
+  lv_obj_center(btn_resync_label);
+
+  lv_obj_t *hint = lv_label_create(content);
+  lv_label_set_text(hint, "Diagnostics mirrors the latest status frame. Use RE-PAIR to drop the current Brain and wait for a fresh handshake.");
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(hint, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+
+  update_diagnostics_panel(latestStatus);
+
+  Serial.println("[UI] Diagnostics screen ready");
+}
+
+// ────────────────────────────────────────────────────────────────
+//  BUILDER SCREEN
+// ────────────────────────────────────────────────────────────────
+void create_builder_screen() {
+  Serial.println("[UI] Creating DAW-style builder...");
+
+  screen_builder = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(screen_builder, lv_color_hex(GORE_BLACK), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(screen_builder, 12, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(screen_builder, LV_SCROLLBAR_MODE_OFF);
+
+  lv_obj_t *top_bar = lv_obj_create(screen_builder);
+  lv_obj_set_size(top_bar, SCREEN_W - 24, 90);
+  lv_obj_align(top_bar, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_style_bg_color(top_bar, lv_color_hex(GORE_SLATE), LV_PART_MAIN);
+  lv_obj_set_style_border_width(top_bar, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(top_bar, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(top_bar, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(top_bar, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(top_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *title = lv_label_create(top_bar);
+  lv_label_set_text(title, "SHOW BUILDER");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_22, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+
+  builder_name_field = lv_textarea_create(top_bar);
+  lv_obj_set_size(builder_name_field, 200, 40);
+  lv_textarea_set_placeholder_text(builder_name_field, "Show Name");
+  lv_textarea_set_one_line(builder_name_field, true);
+  lv_obj_add_event_cb(builder_name_field, [](lv_event_t *evt) {
+    if (evt->code == LV_EVENT_FOCUSED) {
+      attach_keyboard(builder_name_field);
+    } else if (evt->code == LV_EVENT_DEFOCUSED) {
+      detach_keyboard();
+    }
+  }, LV_EVENT_ALL, nullptr);
+
+  lv_obj_t *btn_save = lv_btn_create(top_bar);
+  builder_save_button = btn_save;
+  lv_obj_set_size(btn_save, 140, 44);
+  lv_obj_set_style_bg_color(btn_save, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_save, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_save, builder_save_event_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *save_label = lv_label_create(btn_save);
+  lv_label_set_text(save_label, LV_SYMBOL_DOWNLOAD " SAVE");
+  lv_obj_center(save_label);
+
+  lv_obj_t *btn_clear = lv_btn_create(top_bar);
+  lv_obj_set_size(btn_clear, 120, 44);
+  lv_obj_set_style_bg_color(btn_clear, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_clear, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_clear, builder_clear_event_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *clear_label = lv_label_create(btn_clear);
+  lv_label_set_text(clear_label, LV_SYMBOL_TRASH " CLEAR");
+  lv_obj_center(clear_label);
+
+  lv_obj_t *btn_back = lv_btn_create(top_bar);
+  lv_obj_set_size(btn_back, 110, 44);
+  lv_obj_set_style_bg_color(btn_back, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_radius(btn_back, 10, LV_PART_MAIN);
+  lv_obj_add_event_cb(btn_back, settings_back_event_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *back_label = lv_label_create(btn_back);
+  lv_label_set_text(back_label, LV_SYMBOL_LEFT " BACK");
+  lv_obj_center(back_label);
+
+  builder_library_panel = lv_obj_create(screen_builder);
+  lv_obj_set_size(builder_library_panel, 240, SCREEN_H - 150);
+  lv_obj_align(builder_library_panel, LV_ALIGN_TOP_LEFT, 0, 100);
+  lv_obj_set_style_bg_color(builder_library_panel, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(builder_library_panel, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(builder_library_panel, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(builder_library_panel, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(builder_library_panel, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_row(builder_library_panel, 8, LV_PART_MAIN);
+  lv_obj_set_flex_flow(builder_library_panel, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(builder_library_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+  lv_obj_t *library_title = lv_label_create(builder_library_panel);
+  lv_label_set_text(library_title, "FX LIBRARY");
+  lv_obj_set_style_text_font(library_title, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_color(library_title, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+
+  builder_show_list = lv_obj_create(builder_library_panel);
+  lv_obj_set_size(builder_show_list, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_pad_all(builder_show_list, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(builder_show_list, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(builder_show_list, LV_DIR_VER);
+  lv_obj_set_flex_flow(builder_show_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(builder_show_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_row(builder_show_list, 6, LV_PART_MAIN);
+  lv_obj_set_flex_grow(builder_show_list, 1);
+
+  builder_timeline_area = lv_obj_create(screen_builder);
+  lv_obj_set_size(builder_timeline_area, SCREEN_W - 280, SCREEN_H - 150);
+  lv_obj_align(builder_timeline_area, LV_ALIGN_TOP_RIGHT, 0, 100);
+  lv_obj_set_style_bg_color(builder_timeline_area, lv_color_hex(GORE_PANEL_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_color(builder_timeline_area, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_border_width(builder_timeline_area, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(builder_timeline_area, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(builder_timeline_area, 10, LV_PART_MAIN);
+
+  for (uint8_t lane = 0; lane < BUILDER_LANE_COUNT; ++lane) {
+    yield();
+    lv_obj_t *lane_line = lv_obj_create(builder_timeline_area);
+    lv_obj_set_size(lane_line, LV_PCT(100), 2);
+    lv_obj_set_style_bg_color(lane_line, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+    lv_obj_set_style_border_width(lane_line, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(lane_line, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(lane_line, LV_ALIGN_TOP_LEFT, 0, lane * BUILDER_LANE_HEIGHT);
+
+    lv_obj_t *lane_label = lv_label_create(builder_timeline_area);
+    char laneText[16];
+    snprintf(laneText, sizeof(laneText), "Lane %u", static_cast<unsigned>(lane + 1));
+    lv_label_set_text(lane_label, laneText);
+    lv_obj_set_style_text_font(lane_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lane_label, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+    lv_obj_align(lane_label, LV_ALIGN_TOP_LEFT, 4, lane * BUILDER_LANE_HEIGHT + 6);
+    yield();
+  }
+
+  builder_status_label = lv_label_create(screen_builder);
+  lv_label_set_text(builder_status_label, "Drag cues into the timeline to build a show.");
+  lv_obj_set_style_text_font(builder_status_label, &lv_font_montserrat_16, LV_PART_MAIN);
+  lv_obj_align(builder_status_label, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+
+  toast_container = lv_obj_create(screen_builder);
+  lv_obj_set_size(toast_container, SCREEN_W - 80, 60);
+  lv_obj_align(toast_container, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_set_style_bg_color(toast_container, lv_color_hex(GORE_RED), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(toast_container, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_set_style_radius(toast_container, 12, LV_PART_MAIN);
+  lv_obj_set_style_border_width(toast_container, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(toast_container, 12, LV_PART_MAIN);
+  lv_obj_add_flag(toast_container, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t *toast_label = lv_label_create(toast_container);
+  lv_label_set_text(toast_label, "");
+  lv_obj_set_style_text_font(toast_label, &lv_font_montserrat_18, LV_PART_MAIN);
+  lv_obj_set_style_text_align(toast_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_center(toast_label);
+
+  builder_clear_workspace();
+  load_show_library_from_storage();
+  refresh_show_library();
+
+  Serial.println("[UI] Builder screen ready");
+}
+
+// ────────────────────────────────────────────────────────────────
+//  UI BUILD PIPELINE (Deferred)
 // ────────────────────────────────────────────────────────────────
 void build_ui_incremental() {
   switch (uiStage) {
     case 0:
-      Serial.println("[UI] Stage 0: Creating main menu...");
+      Serial.println("[UI] Stage 0 → Main menu");
       create_main_menu();
       uiStage++;
       break;
-
     case 1:
-      Serial.println("[UI] Stage 1: Creating timeline...");
+      Serial.println("[UI] Stage 1 → Timeline");
       create_timeline_screen();
       uiStage++;
       break;
-
     case 2:
-      Serial.println("[UI] Stage 2: Creating FX designer...");
+      Serial.println("[UI] Stage 2 → FX Designer");
       create_fx_designer_screen();
       uiStage++;
       break;
-
     case 3:
-      Serial.println("[UI] ✓✓✓ ALL UI COMPLETE ✓✓✓");
-      uiCreated = true;
+      Serial.println("[UI] Stage 3 → Live Control");
+      create_live_control_screen();
+      uiStage++;
       break;
+    case 4:
+      Serial.println("[UI] Stage 4 → Settings");
+      create_settings_screen();
+      uiStage++;
+      break;
+    case 5:
+      Serial.println("[UI] Stage 5 → Add-ons");
+      create_addons_screen();
+      uiStage++;
+      break;
+    case 6:
+      Serial.println("[UI] Stage 6 → Builder");
+      create_builder_screen();
+      uiStage++;
+      break;
+    case 7:
+      Serial.println("[UI] Stage 7 → Diagnostics");
+      create_diagnostics_screen();
+      uiStage++;
+      break;
+    case 8:
+      Serial.println("[UI] ✓ All screens created");
+      uiCreated = true;
+      uiStage++;
+      break;
+    default:
+      break;
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+//  ESP-NOW INITIALISATION
+// ────────────────────────────────────────────────────────────────
+bool init_esp_now() {
+  Serial.println("[ESP-NOW] Initialising radio…");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(SHOWDUINO_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_max_tx_power(SHOWDUINO_MAX_TX_POWER);
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_MCS7_SGI);
+  currentChannel = SHOWDUINO_ESPNOW_CHANNEL;
+  currentTxPower = SHOWDUINO_MAX_TX_POWER;
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] ❌ esp_now_init failed");
+    return false;
+  }
+
+  esp_now_register_recv_cb(on_espnow_recv);
+  esp_now_register_send_cb(on_espnow_sent);
+  espNowReady = true;
+
+  // Allow broadcast status reception before pairing
+  esp_now_peer_info_t peerInfo = {};
+  memset(peerInfo.peer_addr, 0xFF, 6);
+  peerInfo.channel = SHOWDUINO_ESPNOW_CHANNEL;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  Serial.printf("[ESP-NOW] Ready on channel %u / TX power %d\n",
+                SHOWDUINO_ESPNOW_CHANNEL, SHOWDUINO_MAX_TX_POWER);
+  return true;
+}
+
+// ────────────────────────────────────────────────────────────────
+//  ESP-NOW PEER MANAGEMENT
+// ────────────────────────────────────────────────────────────────
+void forget_brain_peer() {
+  if (brainPeerKnown) {
+    esp_now_del_peer(brainPeerMac);
+    memset(brainPeerMac, 0, sizeof(brainPeerMac));
+    brainPeerKnown = false;
+    Serial.println("[ESP-NOW] Cleared paired Brain");
+  }
+}
+
+bool ensure_peer_registered(const uint8_t *mac) {
+  if (!mac) return false;
+
+  if (brainPeerKnown && memcmp(mac, brainPeerMac, 6) == 0) {
+    return true;
+  }
+
+  if (!autoPairEnabled) {
+    if (!brainPeerKnown) {
+      Serial.println("[ESP-NOW] Auto-pair disabled – ignoring unknown Brain");
+      return false;
+    }
+    // Already paired with a different MAC: hold lock, ignore newcommer
+    return false;
+  }
+
+  // New peer or changed MAC
+  if (brainPeerKnown) {
+    esp_now_del_peer(brainPeerMac);
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  memcpy(brainPeerMac, mac, 6);
+  peerInfo.channel = SHOWDUINO_ESPNOW_CHANNEL;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+
+  esp_err_t res = esp_now_add_peer(&peerInfo);
+  if (res != ESP_OK) {
+    Serial.printf("[ESP-NOW] ❌ Failed to register peer (err=%d)\n", res);
+    return false;
+  }
+
+  brainPeerKnown = true;
+  char macStr[24];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.printf("[ESP-NOW] Paired with Brain %s\n", macStr);
+  return true;
+}
+
+// ────────────────────────────────────────────────────────────────
+//  ESP-NOW CALLBACKS
+// ────────────────────────────────────────────────────────────────
+void on_espnow_recv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  if (len < (int)sizeof(ShowduinoStatus)) {
+    return;
+  }
+
+  if (!ensure_peer_registered(mac)) {
+    if (!brainPeerKnown || memcmp(mac, brainPeerMac, 6) != 0) {
+      return;
+    }
+  }
+
+  portENTER_CRITICAL_ISR(&statusMux);
+  memcpy(&statusBuffer, incomingData, sizeof(ShowduinoStatus));
+  statusAvailable = true;
+  portEXIT_CRITICAL_ISR(&statusMux);
+
+  lastStatusMillis = millis();
+}
+
+void on_espnow_sent(const uint8_t *mac, esp_now_send_status_t status) {
+  lastSendStatus = status;
+  lastSendMillis = millis();
+}
+
+// ────────────────────────────────────────────────────────────────
+//  COMMAND DISPATCHER
+// ────────────────────────────────────────────────────────────────
+bool send_showduino_command(const ShowduinoCommand &cmd) {
+  if (!espNowReady) {
+    Serial.println("[ESP-NOW] Link not ready, command dropped");
+    return false;
+  }
+  if (!brainPeerKnown) {
+    Serial.println("[ESP-NOW] No Brain paired, command dropped");
+    return false;
+  }
+
+  esp_err_t res = esp_now_send(brainPeerMac, reinterpret_cast<const uint8_t *>(&cmd), sizeof(cmd));
+  if (res != ESP_OK) {
+    Serial.printf("[ESP-NOW] ❌ Send failed (err=%d)\n", res);
+    return false;
+  }
+  return true;
+}
+
+void send_timeline_command(CommandType type, uint32_t position, uint16_t value) {
+  ShowduinoCommand cmd{};
+  cmd.type = type;
+  cmd.position = position;
+  if (type == CMD_TIMELINE_LOOP) {
+    cmd.value = timelineLoopEnabled ? 1 : 0;
+  } else {
+    cmd.value = value;
+  }
+  if (!send_showduino_command(cmd)) {
+    show_toast("Failed to send timeline command", 2500);
+  }
+}
+
+bool send_addon_action(uint8_t addonId, uint8_t action, uint16_t param, uint16_t aux) {
+  ShowduinoCommand cmd{};
+  cmd.type = CMD_ADDON_ACTION;
+  cmd.id = addonId;
+  cmd.value = param;
+  cmd.position = ((uint32_t)action << 16) | aux;
+  bool ok = send_showduino_command(cmd);
+  if (!ok) {
+    show_toast("Add-on command failed", 2500);
+  }
+  yield();
+  return ok;
+}
+
+// ────────────────────────────────────────────────────────────────
+//  STATUS PROCESSING
+// ────────────────────────────────────────────────────────────────
+void handle_status_queue() {
+  bool hasUpdate = false;
+  ShowduinoStatus pending{};
+
+  portENTER_CRITICAL(&statusMux);
+  if (statusAvailable) {
+    pending = statusBuffer;
+    statusAvailable = false;
+    hasUpdate = true;
+  }
+  portEXIT_CRITICAL(&statusMux);
+
+  if (hasUpdate) {
+    latestStatus = pending;
+    if (pingPending) {
+      lastPingRoundtrip = millis() - lastPingSendMillis;
+      pingPending = false;
+    }
+    update_live_controls(latestStatus);
+    update_diagnostics_panel(latestStatus);
+    update_link_indicator();
+    update_addon_cards(latestStatus);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+//  UTILS
+// ────────────────────────────────────────────────────────────────
+void init_backlight_pwm() {
+  ledcSetup(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RESOLUTION);
+  ledcAttachPin(TFT_BL, BACKLIGHT_PWM_CHANNEL);
+  apply_display_brightness(displayBrightness);
+}
+
+void apply_display_brightness(uint8_t level) {
+  displayBrightness = constrain(level, 0, 255);
+  uint32_t dutyMax = (1u << BACKLIGHT_PWM_RESOLUTION) - 1;
+  uint32_t duty = map(displayBrightness, 0, 255, 0, dutyMax);
+  ledcWrite(BACKLIGHT_PWM_CHANNEL, duty);
+
+  if (settings_brightness_value) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u%%", (displayBrightness * 100) / 255);
+    lv_label_set_text(settings_brightness_value, buf);
+  }
+
+  if (settings_brightness_slider) {
+    updatingSettingsUi = true;
+    lv_slider_set_value(settings_brightness_slider, displayBrightness, LV_ANIM_OFF);
+    updatingSettingsUi = false;
+  }
+}
+
+void format_timecode(uint32_t ms, char *buffer, size_t len) {
+  uint32_t totalSeconds = ms / 1000;
+  uint32_t minutes = totalSeconds / 60;
+  uint32_t seconds = totalSeconds % 60;
+  uint32_t tenths = (ms % 1000) / 100;
+  snprintf(buffer, len, "%02lu:%02lu.%01lu", minutes, seconds, tenths);
+}
+
+void refresh_timeline_readout(uint32_t position) {
+  if (!live_timeline_label) return;
+  char buf[16];
+  format_timecode(position, buf, sizeof(buf));
+  lv_label_set_text(live_timeline_label, buf);
+}
+
+void update_mp3_state_label(uint8_t deck, uint8_t state) {
+  if (deck >= 2 || !mp3StateLabel[deck]) return;
+  if (state) {
+    lv_label_set_text(mp3StateLabel[deck], "State: PLAY");
+  } else {
+    lv_label_set_text(mp3StateLabel[deck], "State: STOP");
+  }
+}
+
+void update_live_controls(const ShowduinoStatus &status) {
+  if (!screen_live_control) return;
+  updatingFromStatus = true;
+
+  if (live_mode_btn) {
+    if (status.mode == MODE_MANUAL) {
+      lv_obj_add_state(live_mode_btn, LV_STATE_CHECKED);
+      if (live_mode_label) lv_label_set_text(live_mode_label, "MANUAL");
+    } else {
+      lv_obj_clear_state(live_mode_btn, LV_STATE_CHECKED);
+      if (live_mode_label) lv_label_set_text(live_mode_label, "MONITOR");
+    }
+  }
+
+  for (int i = 0; i < 8; ++i) {
+    if (!relayButtons[i]) continue;
+    if (status.relays[i]) {
+      lv_obj_add_state(relayButtons[i], LV_STATE_CHECKED);
+    } else {
+      lv_obj_clear_state(relayButtons[i], LV_STATE_CHECKED);
+    }
+  }
+
+  for (int deck = 0; deck < 2; ++deck) {
+    if (mp3VolumeSlider[deck]) {
+      lv_slider_set_value(mp3VolumeSlider[deck], status.mp3Vol[deck], LV_ANIM_OFF);
+    }
+    update_mp3_state_label(deck, status.mp3State[deck]);
+  }
+
+  for (int i = 0; i < 4; ++i) {
+    if (ledSlider[i]) {
+      lv_slider_set_value(ledSlider[i], status.ledBrightness[i], LV_ANIM_OFF);
+    }
+  }
+
+  if (live_timeline_slider) {
+    uint32_t clamped = min(status.timelinePos, TIMELINE_MAX_MS);
+    lv_slider_set_value(live_timeline_slider, clamped, LV_ANIM_OFF);
+    refresh_timeline_readout(clamped);
+  }
+
+  if (live_cue_label) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Cue: %u", status.activeCue);
+    lv_label_set_text(live_cue_label, buf);
+  }
+
+  updatingFromStatus = false;
+}
+
+void update_link_indicator() {
+  if (!live_signal_label || !live_peer_label) return;
+
+  if (!brainPeerKnown) {
+    lv_label_set_text(live_signal_label, LV_SYMBOL_WIFI " NO LINK");
+    lv_obj_set_style_text_color(live_signal_label, lv_color_hex(GORE_DARK_RED), LV_PART_MAIN);
+    lv_label_set_text(live_peer_label, "Waiting for Brain...");
+    update_settings_telemetry();
+    return;
+  }
+
+  uint32_t now = millis();
+  uint32_t age = (lastStatusMillis == 0) ? UINT32_MAX : now - lastStatusMillis;
+
+  if (age < LINK_STALE_MS) {
+    lv_label_set_text(live_signal_label, LV_SYMBOL_WIFI " LINK OK");
+    lv_obj_set_style_text_color(live_signal_label, lv_color_hex(0x00FF00), LV_PART_MAIN);
+  } else if (age < LINK_LOST_MS) {
+    lv_label_set_text(live_signal_label, LV_SYMBOL_WIFI " STALE");
+    lv_obj_set_style_text_color(live_signal_label, lv_color_hex(0xFFA500), LV_PART_MAIN);
+  } else {
+    lv_label_set_text(live_signal_label, LV_SYMBOL_WARNING " LOST");
+    lv_obj_set_style_text_color(live_signal_label, lv_color_hex(GORE_BRIGHT_RED), LV_PART_MAIN);
+  }
+
+  char macStr[32];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           brainPeerMac[0], brainPeerMac[1], brainPeerMac[2],
+           brainPeerMac[3], brainPeerMac[4], brainPeerMac[5]);
+  lv_label_set_text(live_peer_label, macStr);
+  update_settings_telemetry();
+}
+
+void update_settings_telemetry() {
+  uint32_t now = millis();
+
+  if (settings_autopair_switch) {
+    updatingSettingsUi = true;
+    if (autoPairEnabled) {
+      lv_obj_add_state(settings_autopair_switch, LV_STATE_CHECKED);
+    } else {
+      lv_obj_clear_state(settings_autopair_switch, LV_STATE_CHECKED);
+    }
+    updatingSettingsUi = false;
+  }
+
+  if (settings_autopair_label) {
+    lv_label_set_text_fmt(settings_autopair_label, "Auto-Pair: %s",
+                          autoPairEnabled ? "Enabled (listen & lock)" : "Manual (hold paired Brain)");
+  }
+
+  if (settings_txpower_slider) {
+    updatingSettingsUi = true;
+    lv_slider_set_value(settings_txpower_slider, currentTxPower, LV_ANIM_OFF);
+    updatingSettingsUi = false;
+  }
+
+  if (settings_txpower_value) {
+    float dbm = currentTxPower / 4.0f;
+    lv_label_set_text_fmt(settings_txpower_value, "%d (%.1f dBm)", currentTxPower, dbm);
+  }
+
+  if (settings_channel_label) {
+    lv_label_set_text_fmt(settings_channel_label, "Channel: %u  • PHY: MCS7 (Short GI)",
+                          currentChannel);
+  }
+
+  if (settings_peer_label) {
+    if (brainPeerKnown) {
+      lv_label_set_text_fmt(settings_peer_label, "Paired Brain: %02X:%02X:%02X:%02X:%02X:%02X",
+                            brainPeerMac[0], brainPeerMac[1], brainPeerMac[2],
+                            brainPeerMac[3], brainPeerMac[4], brainPeerMac[5]);
+    } else {
+      lv_label_set_text(settings_peer_label, "Paired Brain: (none)");
+    }
+  }
+
+  if (settings_last_status_label) {
+    if (lastStatusMillis == 0) {
+      lv_label_set_text(settings_last_status_label, "Last Status: none received");
+    } else {
+      uint32_t age = now - lastStatusMillis;
+      lv_label_set_text_fmt(settings_last_status_label, "Last Status: %lu ms ago", static_cast<unsigned long>(age));
+    }
+  }
+
+  if (settings_ping_label) {
+    if (pingPending) {
+      uint32_t elapsed = now - lastPingSendMillis;
+      if (elapsed > 5000) {
+        pingPending = false;
+        lastPingRoundtrip = 0;
+        lv_label_set_text(settings_ping_label, "Ping: timeout (>5s)");
+      } else {
+        lv_label_set_text_fmt(settings_ping_label, "Ping: pending (%lu ms)", static_cast<unsigned long>(elapsed));
+      }
+    } else if (lastPingRoundtrip > 0) {
+      lv_label_set_text_fmt(settings_ping_label, "Ping: %lu ms round-trip", static_cast<unsigned long>(lastPingRoundtrip));
+    } else {
+      lv_label_set_text(settings_ping_label, "Ping: not run");
+    }
+  }
+}
+
+void update_diagnostics_panel(const ShowduinoStatus &status) {
+  if (!diag_mode_label) return;
+
+  if (lastStatusMillis == 0) {
+    lv_label_set_text(diag_mode_label, "--");
+    if (diag_relay_label) lv_label_set_text(diag_relay_label, "--");
+    if (diag_mp3_label) lv_label_set_text(diag_mp3_label, "--");
+    if (diag_led_label) lv_label_set_text(diag_led_label, "--");
+    if (diag_timeline_label) lv_label_set_text(diag_timeline_label, "--");
+    if (diag_last_update_label) lv_label_set_text(diag_last_update_label, "Last Status: none");
+    return;
+  }
+
+  const char *modeStr = status.mode == MODE_MANUAL ? "MANUAL (desk override)" : "AUTO (timeline)";
+  lv_label_set_text(diag_mode_label, modeStr);
+
+  if (diag_relay_label) {
+    char buf[64];
+    char *ptr = buf;
+    for (size_t i = 0; i < 8; ++i) {
+      ptr += snprintf(ptr, sizeof(buf) - (ptr - buf), "%u%s", status.relays[i],
+                      (i < 7) ? " " : "");
+    }
+    lv_label_set_text(diag_relay_label, buf);
+  }
+
+  if (diag_mp3_label) {
+    char buf[80];
+    const char *stateA = status.mp3State[0] ? "PLAY" : "STOP";
+    const char *stateB = status.mp3State[1] ? "PLAY" : "STOP";
+    snprintf(buf, sizeof(buf), "A:%u/%s  B:%u/%s",
+             status.mp3Vol[0], stateA, status.mp3Vol[1], stateB);
+    lv_label_set_text(diag_mp3_label, buf);
+  }
+
+  if (diag_led_label) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%u  %u  %u  %u",
+             status.ledBrightness[0], status.ledBrightness[1],
+             status.ledBrightness[2], status.ledBrightness[3]);
+    lv_label_set_text(diag_led_label, buf);
+  }
+
+  if (diag_timeline_label) {
+    char timecode[16];
+    format_timecode(status.timelinePos, timecode, sizeof(timecode));
+    lv_label_set_text_fmt(diag_timeline_label, "Cue %u @ %s", status.activeCue, timecode);
+  }
+
+  if (diag_last_update_label) {
+    if (lastStatusMillis == 0) {
+      lv_label_set_text(diag_last_update_label, "Last Status: none");
+    } else {
+      uint32_t age = millis() - lastStatusMillis;
+      lv_label_set_text_fmt(diag_last_update_label, "Last Status: %lu ms ago",
+                            static_cast<unsigned long>(age));
+    }
+  }
+}
+
+void update_addon_cards(const ShowduinoStatus &status) {
+  for (size_t i = 0; i < addonCardCount; ++i) {
+    AddonCardContext *ctx = &addonCardContexts[i];
+    if (!ctx || !ctx->def || !ctx->def->refreshFn) continue;
+    if (ctx->def->requiresI2C && !addon_is_available(ctx->def)) continue;
+    ctx->def->refreshFn(ctx, status);
+    yield();
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+//  EVENT HANDLERS
+// ────────────────────────────────────────────────────────────────
+void mode_toggle_event_cb(lv_event_t *e) {
+  if (updatingFromStatus) return;
+  lv_obj_t *btn = lv_event_get_target(e);
+  bool manual = lv_obj_has_state(btn, LV_STATE_CHECKED);
+  if (live_mode_label) lv_label_set_text(live_mode_label, manual ? "MANUAL" : "MONITOR");
+
+  ShowduinoCommand cmd{};
+  cmd.type = CMD_CONTROL_MODE;
+  cmd.value = manual ? MODE_MANUAL : MODE_AUTO;
+  send_showduino_command(cmd);
+}
+
+void timeline_event_cb(lv_event_t *e) {
+  lv_obj_t *slider = lv_event_get_target(e);
+  uint32_t position = lv_slider_get_value(slider);
+
+  if (e->code == LV_EVENT_VALUE_CHANGED) {
+    refresh_timeline_readout(position);
+    if (updatingFromStatus) return;
+    // Preview seek while dragging
+    ShowduinoCommand preview{};
+    preview.type = CMD_TIMELINE_PREVIEW;
+    preview.position = position;
+    send_showduino_command(preview);
+  } else if (e->code == LV_EVENT_RELEASED) {
+    if (updatingFromStatus) return;
+    ShowduinoCommand play{};
+    play.type = CMD_TIMELINE_PLAY;
+    play.position = position;
+    send_showduino_command(play);
+  }
+}
+
+void relay_event_cb(lv_event_t *e) {
+  if (updatingFromStatus) return;
+  lv_obj_t *btn = lv_event_get_target(e);
+  const uint8_t *relayIdPtr = static_cast<const uint8_t *>(lv_event_get_user_data(e));
+  if (!relayIdPtr) return;
+  bool state = lv_obj_has_state(btn, LV_STATE_CHECKED);
+
+  ShowduinoCommand cmd{};
+  cmd.type = CMD_RELAY;
+  cmd.id = *relayIdPtr;
+  cmd.value = state ? 1 : 0;
+  send_showduino_command(cmd);
+}
+
+void mp3_volume_event_cb(lv_event_t *e) {
+  if (updatingFromStatus) return;
+  const uint8_t *deckPtr = static_cast<const uint8_t *>(lv_event_get_user_data(e));
+  if (!deckPtr) return;
+  uint16_t volume = lv_slider_get_value(lv_event_get_target(e));
+
+  ShowduinoCommand cmd{};
+  cmd.type = CMD_MP3_VOLUME;
+  cmd.id = *deckPtr;
+  cmd.value = volume;
+  send_showduino_command(cmd);
+}
+
+void mp3_transport_event_cb(lv_event_t *e) {
+  const Mp3ButtonMeta *meta = static_cast<const Mp3ButtonMeta *>(lv_event_get_user_data(e));
+  if (!meta) return;
+
+  ShowduinoCommand cmd{};
+  cmd.id = meta->deck;
+
+  if (meta->action == MP3_ACT_PLAY) {
+    cmd.type = CMD_MP3_PLAY;
+    cmd.value = 1;
+  } else {
+    cmd.type = CMD_MP3_STOP;
+    cmd.value = 0;
+  }
+  send_showduino_command(cmd);
+}
+
+void led_slider_event_cb(lv_event_t *e) {
+  if (updatingFromStatus) return;
+  const uint8_t *linePtr = static_cast<const uint8_t *>(lv_event_get_user_data(e));
+  if (!linePtr) return;
+
+  uint16_t brightness = lv_slider_get_value(lv_event_get_target(e));
+  ShowduinoCommand cmd{};
+  cmd.type = CMD_LED;
+  cmd.id = *linePtr;
+  cmd.value = brightness;
+  send_showduino_command(cmd);
+}
+
+void toolbar_event_cb(lv_event_t *e) {
+  CommandType type = static_cast<CommandType>((uintptr_t)lv_event_get_user_data(e));
+
+  ShowduinoCommand cmd{};
+  cmd.type = type;
+  send_showduino_command(cmd);
+}
+
+void pair_button_event_cb(lv_event_t *e) {
+  (void)e;
+  forget_brain_peer();
+  update_link_indicator();
+}
+
+void settings_brightness_event_cb(lv_event_t *e) {
+  if (updatingSettingsUi) return;
+  uint16_t level = lv_slider_get_value(lv_event_get_target(e));
+  apply_display_brightness(level);
+}
+
+void settings_autopair_event_cb(lv_event_t *e) {
+  bool enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  autoPairEnabled = enabled;
+  Serial.printf("[ESP-NOW] Auto-pair %s\n", enabled ? "ENABLED" : "DISABLED");
+  update_settings_telemetry();
+}
+
+void settings_txpower_event_cb(lv_event_t *e) {
+  int raw = lv_slider_get_value(lv_event_get_target(e));
+  int quantized = (raw / 4) * 4;
+  if (quantized < 8) quantized = 8;
+  if (quantized > SHOWDUINO_MAX_TX_POWER) quantized = SHOWDUINO_MAX_TX_POWER;
+  currentTxPower = quantized;
+  updatingSettingsUi = true;
+  lv_slider_set_value(lv_event_get_target(e), currentTxPower, LV_ANIM_OFF);
+  updatingSettingsUi = false;
+  if (espNowReady) {
+    esp_wifi_set_max_tx_power(currentTxPower);
+  }
+  update_settings_telemetry();
+}
+
+void settings_ping_event_cb(lv_event_t *e) {
+  (void)e;
+  ShowduinoCommand cmd{};
+  cmd.type = CMD_PING;
+  if (send_showduino_command(cmd)) {
+    pingPending = true;
+    lastPingSendMillis = millis();
+    lastPingRoundtrip = 0;
+  }
+  update_settings_telemetry();
+}
+
+void settings_back_event_cb(lv_event_t *e) {
+  (void)e;
+  detach_keyboard();
+  if (screen_main) {
+    lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+  }
+}
+
+void diagnostics_back_event_cb(lv_event_t *e) {
+  (void)e;
+  if (screen_main) {
+    lv_scr_load_anim(screen_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
   }
 }
 
@@ -504,44 +3241,26 @@ void build_ui_incremental() {
 // ────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(250);
 
-  Serial.println("\n╔════════════════════════════════════════════════════════════╗");
-  Serial.println("║  SHOWDUINO STUDIO v4.3 – GORE FX EDITION (Safe Boot)       ║");
-  Serial.println("╚════════════════════════════════════════════════════════════╝\n");
+  Serial.println();
+  Serial.println("╔════════════════════════════════════════════════════════════╗");
+  Serial.println("║  SHOWDUINO STUDIO – ESP-NOW Communications Edition v5.0    ║");
+  Serial.println("╚════════════════════════════════════════════════════════════╝");
 
+  // Optional: disable brownout during heavy boot
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
-// Call this once in setup(), before WiFi.begin()
-WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t info){
-  switch (e) {
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      Serial.printf("[WiFi] Disconnected, reason=%d\n", info.wifi_sta_disconnected.reason);
-      break;
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.printf("[WiFi] Connected to AP\n");
-      break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf("[WiFi] Got IP: %s\n", WiFi.localIP().toString().c_str());
-      break;
-    default:
-      break;
-  }
-});
-
-
-  // ────────────────────────────────────────────────────────────────
-  //  Stage 1: Display Initialization
-  // ────────────────────────────────────────────────────────────────
   pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
-  Serial.println("[BOOT] Initializing RGB panel...");
+  init_backlight_pwm();
 
+  Serial.println("[BOOT] Initialising RGB panel...");
   rgbpanel = new Arduino_ESP32RGBPanel(
-    TFT_DE, TFT_VSYNC, TFT_HSYNC, TFT_PCLK,
-    TFT_R1, TFT_R2, TFT_R3, TFT_R4, TFT_R5,
-    TFT_G0, TFT_G1, TFT_G2, TFT_G3, TFT_G4, TFT_G5,
-    TFT_B1, TFT_B2, TFT_B3, TFT_B4, TFT_B5,
-    0, 40, 48, 40, 0, 13, 3, 29, 1, 16000000);
+      TFT_DE, TFT_VSYNC, TFT_HSYNC, TFT_PCLK,
+      TFT_R1, TFT_R2, TFT_R3, TFT_R4, TFT_R5,
+      TFT_G0, TFT_G1, TFT_G2, TFT_G3, TFT_G4, TFT_G5,
+      TFT_B1, TFT_B2, TFT_B3, TFT_B4, TFT_B5,
+      0, 40, 48, 40, 0, 13, 3, 29, 1, 16000000);
 
   if (!rgbpanel) {
     Serial.println("[ERROR] ❌ RGB panel allocation failed!");
@@ -554,51 +3273,103 @@ WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t info){
     while (true) delay(1000);
   }
 
-  Serial.printf("[DEBUG] Free heap: %d KB | Free PSRAM: %d KB\n",
-                ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
-
   if (!gfx->begin()) {
-    Serial.println("[ERROR] ❌ gfx->begin() failed! Check display wiring or PSRAM.");
+    Serial.println("[ERROR] ❌ gfx->begin() failed – check wiring / PSRAM");
     while (true) delay(1000);
   }
 
-  gfx->fillScreen(BLACK);
-  gfx->setTextColor(GORE_RED);
-  gfx->setTextSize(3);
-  gfx->setCursor(150, 180);
-  gfx->println("SHOWDUINO STUDIO");
-  gfx->setTextSize(2);
-  gfx->setCursor(200, 230);
-  gfx->println("Gore FX Edition v4.3");
-  Serial.println("[1/5] ✓ Display initialized");
-  delay(500);
+  showBootScreen(1, "Display ready");
+  Serial.println("[1/7] ✓ Display initialised");
+  delay(200);
 
-  // ────────────────────────────────────────────────────────────────
-  //  Stage 2: LVGL Initialization
-  // ────────────────────────────────────────────────────────────────
-  gfx->setTextColor(GORE_RED);
-  gfx->setCursor(200, 270);
-  gfx->println("Initializing LVGL...");
-  Serial.println("[BOOT] Initializing LVGL...");
-
+  Serial.println("[BOOT] Initialising LVGL...");
   if (!init_lvgl()) {
-    Serial.println("[ERROR] ❌ LVGL init failed – insufficient PSRAM or bad buffers");
+    Serial.println("[ERROR] ❌ LVGL init failed – insufficient PSRAM?");
     while (true) delay(1000);
   }
+  showBootScreen(2, "LVGL ready");
+  Serial.println("[2/7] ✓ LVGL ready");
+  delay(200);
 
-  Serial.println("[2/5] ✓ LVGL ready");
-  delay(500);
-
-  // ────────────────────────────────────────────────────────────────
-  //  Stage 3: Touch Initialization
-  // ────────────────────────────────────────────────────────────────
-  gfx->setCursor(200, 290);
-  gfx->println("Initializing Touch...");
-  Serial.println("[BOOT] Initializing GT911 touch...");
-
-  delay(100);  // Ensure I2C bus is stable before touch init
+  Serial.println("[BOOT] Initialising GT911 touch...");
   Wire.begin(TOUCH_SDA, TOUCH_SCL, 400000);
-
   ts_ptr = new TAMC_GT911(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, SCREEN_W, SCREEN_H);
-  if (!ts_ptr) {
-    Serial.prin
+  if (!ts_ptr || !ts_ptr->begin()) {
+    Serial.println("[ERROR] ❌ Touch init failed – GT911 not responding");
+    while (true) delay(1000);
+  }
+  showBootScreen(3, "Touch ready");
+  Serial.println("[3/7] ✓ Touch ready");
+  delay(200);
+
+  Serial.println("[BOOT] Initialising ESP-NOW link...");
+  if (!init_esp_now()) {
+    showBootScreen(4, "ESP-NOW failed!");
+    Serial.println("[ERROR] ❌ ESP-NOW init failed");
+    while (true) delay(1000);
+  }
+  showBootScreen(4, "ESP-NOW ready");
+  Serial.println("[4/7] ✓ ESP-NOW ready");
+  delay(200);
+
+  showBootScreen(5, "Mounting storage…");
+  Serial.println("[BOOT] Mounting storage (SD first)...");
+  if (init_storage()) {
+    Serial.println("[5/7] ✓ SD storage ready");
+  } else {
+    Serial.println("[5/7] ⚠️ SD storage unavailable, using RAM-only assets");
+  }
+  delay(200);
+
+  showBootScreen(6, "Scanning add-ons…");
+  Serial.println("[BOOT] Scanning I2C bus for add-ons");
+  scan_i2c_bus();
+  update_addon_availability();
+  if (init_rtc()) {
+    Serial.println("[RTC] ✓ DS3231 ready");
+  } else {
+    Serial.println("[RTC] ⚠️ DS3231 not detected");
+  }
+  Serial.println("[6/7] ✓ Add-on scan complete");
+  delay(200);
+
+  showBootScreen(7, "Building UI…");
+  Serial.println("[BOOT] Launching deferred UI build");
+  Serial.println("[7/7] ✓ UI pipeline scheduled");
+
+  systemReady = true;
+}
+
+// ────────────────────────────────────────────────────────────────
+//  LOOP
+// ────────────────────────────────────────────────────────────────
+void loop() {
+  if (!systemReady) {
+    delay(10);
+    return;
+  }
+
+  static uint32_t lastUiBuild = 0;
+  uint32_t now = millis();
+
+  if (!uiCreated && (now - lastUiBuild) > 60) {
+    build_ui_incremental();
+    lastUiBuild = now;
+  }
+
+  static uint32_t lastTick = 0;
+  uint32_t tickNow = millis();
+  lv_tick_inc(tickNow - lastTick);
+  lastTick = tickNow;
+  lv_timer_handler();
+
+  handle_status_queue();
+
+  static uint32_t lastLinkRefresh = 0;
+  if (now - lastLinkRefresh > 500) {
+    update_link_indicator();
+    lastLinkRefresh = now;
+  }
+
+  delay(5);
+}
