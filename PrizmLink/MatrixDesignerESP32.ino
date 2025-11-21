@@ -32,6 +32,167 @@ AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
+const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PrizmLink LED Matrix Designer</title>
+    <link rel="stylesheet" href="/web/style.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <header class="app-bar">
+      <div class="brand">
+        <span class="dot"></span>
+        <div>
+          <h1>PrizmLink Matrix Designer</h1>
+          <small>10×21 WS2812 · ESP32-S3 Live Desk</small>
+        </div>
+      </div>
+      <div class="status-block">
+        <div class="status-indicator" id="connectionStatus">
+          <span class="pulse"></span>
+          <span class="label">Disconnected</span>
+        </div>
+        <div class="status-meta">
+          <span id="fpsDisplay">0 FPS</span>
+          <span id="packetDisplay">0 pkts</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel tool-panel">
+        <h2>Tools</h2>
+        <div class="tool-buttons" role="toolbar" aria-label="Drawing tools">
+          <button class="tool active" data-tool="pen">Pen</button>
+          <button class="tool" data-tool="eraser">Eraser</button>
+          <button class="tool" data-tool="fill">Fill</button>
+          <button class="tool" data-tool="line">Line</button>
+          <button class="tool" data-tool="rectangle">Rectangle</button>
+          <button class="tool" data-tool="circle">Circle</button>
+        </div>
+        <div class="control-group">
+          <label for="colorPicker">Color</label>
+          <input type="color" id="colorPicker" value="#ff004d" />
+        </div>
+        <div class="control-group">
+          <label for="brushSize">Brush Size</label>
+          <input type="range" id="brushSize" min="1" max="4" value="1" />
+        </div>
+        <div class="control-pair">
+          <button id="undoBtn" class="ghost">Undo</button>
+          <button id="redoBtn" class="ghost">Redo</button>
+        </div>
+        <div class="control-group">
+          <label for="zoomSlider">Zoom</label>
+          <input type="range" id="zoomSlider" min="8" max="26" value="18" />
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="onionToggle" />
+          <span>Onion-skin preview</span>
+        </label>
+      </section>
+
+      <section class="panel canvas-panel">
+        <div class="panel-header">
+          <h2>LED Matrix</h2>
+          <div>
+            <button id="clearFrame" class="ghost">Clear</button>
+            <button id="sendFrameBtn">Send Frame</button>
+          </div>
+        </div>
+        <div id="matrixContainer">
+          <div id="matrixGrid" role="grid" aria-label="LED matrix"></div>
+        </div>
+      </section>
+
+      <section class="panel animation-panel">
+        <div class="panel-header">
+          <h2>Animation</h2>
+          <div class="control-pair">
+            <button id="playPauseBtn">Play</button>
+            <label class="toggle small">
+              <input type="checkbox" id="loopToggle" checked />
+              <span>Loop</span>
+            </label>
+          </div>
+        </div>
+        <div class="frame-controls">
+          <button id="addFrame">Add</button>
+          <button id="duplicateFrame">Duplicate</button>
+          <button id="deleteFrame" class="ghost">Delete</button>
+        </div>
+        <label for="fpsSlider">FPS <span id="fpsValue">24</span></label>
+        <input type="range" id="fpsSlider" min="5" max="50" value="24" />
+        <div class="frame-strip" id="frameStrip" aria-label="Animation frames"></div>
+      </section>
+
+      <section class="panel effects-panel">
+        <div class="panel-header">
+          <h2>Built-in Effects</h2>
+          <button id="applyEffect">Apply to Frame</button>
+        </div>
+        <select id="effectSelect">
+          <option value="rainbow">Rainbow</option>
+          <option value="fire">Fire</option>
+          <option value="twinkle">Twinkle</option>
+          <option value="snow">Snow</option>
+          <option value="glitch">Glitch</option>
+          <option value="meteor">Meteor</option>
+        </select>
+        <div id="effectOptions"></div>
+      </section>
+
+      <section class="panel device-panel">
+        <h2>Device Control</h2>
+        <label for="brightnessSlider">Brightness <span id="brightnessValue">128</span></label>
+        <input type="range" id="brightnessSlider" min="1" max="255" value="128" />
+
+        <label for="speedSlider">Speed <span id="speedValue">50</span></label>
+        <input type="range" id="speedSlider" min="1" max="100" value="50" />
+
+        <label for="modeSelect">Mode</label>
+        <select id="modeSelect">
+          <option value="static">Static</option>
+          <option value="animation">Animation</option>
+          <option value="effect">Effect</option>
+        </select>
+
+        <button id="sendAnimationBtn">Send Animation</button>
+      </section>
+
+      <section class="panel file-panel">
+        <h2>File Management</h2>
+        <button id="saveAnimationBtn">Save to ESP32</button>
+        <button id="loadAnimationBtn">Load from ESP32</button>
+        <button id="exportJsonBtn" class="ghost">Export JSON</button>
+        <label class="import-label">
+          Import JSON
+          <input type="file" id="importJsonInput" accept="application/json" />
+        </label>
+        <select id="espFileList" size="4" aria-label="Stored animations"></select>
+      </section>
+    </main>
+
+    <template id="frameThumbTemplate">
+      <button class="frame-thumb">
+        <canvas width="84" height="40"></canvas>
+        <span class="caption"></span>
+      </button>
+    </template>
+
+    <script src="/web/script.js" type="module"></script>
+  </body>
+</html>
+)HTML";
+
 Pixel frontBuffer[LED_COUNT];
 Pixel backBuffer[LED_COUNT];
 volatile bool frameReady = false;
@@ -109,8 +270,13 @@ void setup() {
   ws.onEvent(handleWebSocketEvent);
   server.addHandler(&ws);
 
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", INDEX_HTML);
+  });
+  server.on("/index.html", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", INDEX_HTML);
+  });
   server.serveStatic("/web", SPIFFS, "/web");
-  server.serveStatic("/", SPIFFS, "/web/").setDefaultFile("index.html");
 
   server.on("/api/animations", HTTP_GET, handleAnimationList);
   server.onNotFound(handleAnimationFetch);
