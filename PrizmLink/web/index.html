@@ -3,60 +3,389 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PrizmLink Control</title>
+  <meta name="description" content="Showduino is a cinematic smart-FX control platform for immersive theatre, haunted attractions, and interactive props." />
+  <title>Showduino • Immersive FX Control</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&family=Orbitron:wght@500;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/web/style.css" />
 </head>
-<body data-version="%VERSION%" data-ip="%IP%">
-  <header>
-    <h1>PrizmLink Receiver <span id="version"></span></h1>
-    <p>IP: <span id="ip"></span></p>
-    <div id="connection" class="status disconnected">Disconnected</div>
+<body>
+  <div class="bg-glow" aria-hidden="true">
+    <span class="glow red"></span>
+    <span class="glow cyan"></span>
+    <span class="glow green"></span>
+  </div>
+  <div class="scanline" aria-hidden="true"></div>
+  <div class="noisy" aria-hidden="true"></div>
+
+  <header class="site-header" id="top">
+    <div class="logo-stack">
+      <div class="logo-icon">
+        <span></span><span></span><span></span>
+      </div>
+      <div>
+        <div class="logo-title">Showduino</div>
+        <div class="logo-subtitle">Immersive FX Control</div>
+      </div>
+    </div>
+    <nav class="primary-nav" aria-label="Primary">
+      <a href="#what">What</a>
+      <a href="#features">Features</a>
+      <a href="#props">Props</a>
+      <a href="#downloads">Downloads</a>
+      <a href="#contact">Contact</a>
+    </nav>
+    <button class="nav-toggle" aria-label="Toggle navigation">
+      <span></span><span></span><span></span>
+    </button>
   </header>
 
-  <main>
-    <section aria-labelledby="dashboard-heading">
-      <h2 id="dashboard-heading">Dashboard</h2>
-      <div class="grid">
-        <div class="card" aria-live="polite">
-          <h3>FPS</h3>
-          <div id="fps" data-unit="fps">0</div>
+  <section class="hero" id="hero">
+    <div class="hero-content">
+      <p class="eyebrow">Immersive theatre · Haunted attractions · Interactive FX</p>
+      <h1>
+        <span class="glitch-title" data-text="Showduino">Showduino</span>
+        <span class="tagline">Real-time control. Real-world immersion.</span>
+      </h1>
+      <p class="intro">
+        A dual-ESP32-S3 system built for cinematic control rooms. The UI deck captures touch and timelines, while the Showduino Brain executes relays, DMX, audio and pixels with ruthless precision.
+      </p>
+      <div class="cta-row">
+        <a class="btn primary" href="#studio">Launch Studio Dashboard</a>
+        <button class="btn ghost" data-target="#hauntsync">HauntSync Access</button>
+      </div>
+      <div class="quick-access" role="navigation" aria-label="Quick access">
+        <button class="quick-link" data-target="#studio">Studio Dashboard</button>
+        <button class="quick-link" data-target="#features">Features</button>
+        <button class="quick-link" data-target="#props">Props</button>
+        <button class="quick-link" data-target="#downloads">Downloads</button>
+        <button class="quick-link" data-target="#contact">Contact</button>
+      </div>
+      <div class="hero-metrics">
+        <div>
+          <strong>Pixel Engine</strong>
+          <span>4 lines · 4K+ WS2812B</span>
         </div>
-        <div class="card" aria-live="polite">
-          <h3>Packets</h3>
-          <div id="packets">0</div>
+        <div>
+          <strong>Relay & DMX</strong>
+          <span>16 relays · full E1.31</span>
         </div>
-        <div class="card" aria-live="polite">
-          <h3>Manual Override</h3>
-          <div id="manual">false</div>
-        </div>
-        <div class="card" aria-live="polite">
-          <h3>Uptime</h3>
-          <div id="uptime">0s</div>
+        <div>
+          <strong>Audio Decks</strong>
+          <span>Dual MP3 · DFPlayer</span>
         </div>
       </div>
-    </section>
-
-    <section aria-labelledby="lighting-heading">
-      <h2 id="lighting-heading">Lighting</h2>
-      <div class="controls">
-        <label for="brightness">Brightness</label>
-        <input type="range" id="brightness" min="0" max="255" value="200" />
-
-        <label for="pixelCount">Pixel Count</label>
-        <input type="number" id="pixelCount" min="1" max="1024" step="1" />
-
-        <button id="saveLighting" type="button">Save Lighting Config</button>
+    </div>
+    <div class="hero-visual" aria-hidden="true">
+      <div class="led-sculpt">
+        <span></span><span></span><span></span><span></span><span></span>
+        <span></span><span></span><span></span><span></span><span></span>
+        <span></span><span></span><span></span><span></span><span></span>
       </div>
-    </section>
-
-    <section aria-labelledby="logs-heading">
-      <h2 id="logs-heading">Logs & Diagnostics</h2>
-      <div class="controls">
-        <button id="downloadLogs" type="button">Download Latest Run Log</button>
+      <div class="waveform">
+        <span style="--i:0"></span>
+        <span style="--i:1"></span>
+        <span style="--i:2"></span>
+        <span style="--i:3"></span>
+        <span style="--i:4"></span>
+        <span style="--i:5"></span>
+        <span style="--i:6"></span>
+        <span style="--i:7"></span>
+        <span style="--i:8"></span>
+        <span style="--i:9"></span>
       </div>
-    </section>
-  </main>
+      <div class="circuit-map">
+        <div class="pulse"></div>
+        <div class="trace"></div>
+      </div>
+    </div>
+  </section>
 
-  <script src="/web/app.js"></script>
+  <section class="section" id="what">
+    <div class="section-header">
+      <p class="eyebrow">What is Showduino?</p>
+      <h2>A control desk + execution brain</h2>
+      <p>
+        Showduino mirrors a professional production pipeline: the UI ESP32-S3 deck (JC8048W550C + GT911) handles LVGL visuals, while the separate Brain ESP32-S3 fires relays, LEDs, FX, DMX and MP3 playback. The two boards exchange structured JSON over UART or Wi-Fi.
+      </p>
+    </div>
+    <div class="diagram">
+      <article class="diagram-card">
+        <h3>UI Deck</h3>
+        <p>Touchscreen console running LVGL, Montserrat UI, session-aware timelines.</p>
+        <ul>
+          <li>Manual / Auto control modes</li>
+          <li>Live timeline scrubbing & cue stack</li>
+          <li>Relays, LEDs, MP3 widgets mirrored from Brain</li>
+          <li>Status bar, toast alerts, Wi-Fi + serial handoff</li>
+        </ul>
+      </article>
+      <div class="diagram-link">
+        <span class="json-pill">{"cmd":"relay","id":3,"state":1}</span>
+        <span class="json-pill">{"cmd":"led","line":1,"pixel":42}</span>
+        <span class="json-pill">{"status":"ok","mode":"auto"}</span>
+      </div>
+      <article class="diagram-card">
+        <h3>Showduino Brain</h3>
+        <p>ESP32-S3 control hub executing every physical action safely.</p>
+        <ul>
+          <li>Relay, DMX, SX1509 expansion</li>
+          <li>Pixel matrices, WS2812B & power domains</li>
+          <li>DFPlayer dual audio decks + SD logging</li>
+          <li>PrizmLink prop auto-detection via I²C</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="features">
+    <div class="section-header">
+      <p class="eyebrow">System Highlights</p>
+      <h2>Features built for live shows</h2>
+    </div>
+    <div class="feature-grid">
+      <article>
+        <h3>Pixel Control</h3>
+        <p>WS2812B lines, matrices, volumetric props with per-pixel gradients.</p>
+      </article>
+      <article>
+        <h3>Relay & DMX Triggers</h3>
+        <p>Direct strike of motors, foggers, relays, plus E1.31 DMX universes.</p>
+      </article>
+      <article>
+        <h3>Timeline Editor</h3>
+        <p>DAW-style editor with cues, macros, timecode and granular scrubbing.</p>
+      </article>
+      <article>
+        <h3>Live Controls</h3>
+        <p>Tactile toggles, MANUAL/AUTO modes, Stop All, Next Cue, Back.</p>
+      </article>
+      <article>
+        <h3>Audio Integration</h3>
+        <p>Dual MP3 decks (A/B), waveform previews, DFPlayer commands, fades.</p>
+      </article>
+      <article>
+        <h3>Network Ready</h3>
+        <p>Serial bridge today, Wi-Fi AP & STA tomorrow. Live status mirroring.</p>
+      </article>
+      <article>
+        <h3>Prop Auto-Detection</h3>
+        <p>I²C / PrizmLink handshake discovers props and loads matching FX maps.</p>
+      </article>
+      <article>
+        <h3>WiFi + AP Mode</h3>
+        <p>Secure dashboard access for designers, offline AP for field ops.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="props">
+    <div class="section-header">
+      <p class="eyebrow">Props & Add-ons</p>
+      <h2>Ready-made thrills & expansion</h2>
+    </div>
+    <div class="gallery-grid">
+      <article>
+        <h3>Lantern Network</h3>
+        <p>Individually addressed lanterns with flicker FX and proximity sensors.</p>
+      </article>
+      <article>
+        <h3>R3 Console</h3>
+        <p>Showrunner-grade console for cue overrides and live notes.</p>
+      </article>
+      <article>
+        <h3>Haunted Effects</h3>
+        <p>Motion-reactive doors, pneumatics, and lighting bursts triggered in sync.</p>
+      </article>
+      <article>
+        <h3>Pixel Strips & Matrices</h3>
+        <p>Ceiling scrims, tunnel chases, LED costumes with gradient presets.</p>
+      </article>
+      <article>
+        <h3>SX1509 Expansion</h3>
+        <p>Button/relay expansion bus for scenic interfaces and arm panels.</p>
+      </article>
+      <article>
+        <h3>Sensors & Relays</h3>
+        <p>Magnet, PIR, lidar, smoke, and custom sensors with programmable cues.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section studio" id="studio">
+    <div class="section-header">
+      <p class="eyebrow">Showduino Studio</p>
+      <h2>DAW-style timeline + live control deck</h2>
+      <p>Stack cues, scrub manually, or mirror automation in Monitor mode. The Studio Dashboard keeps relays, pixels, MP3 decks, and props in one cinematic console.</p>
+    </div>
+    <div class="studio-panel">
+      <div class="timeline">
+        <div class="timeline-head">
+          <span>Timeline</span>
+          <span id="timeline-time">00:42.000</span>
+        </div>
+        <div class="timeline-track">
+          <div class="cue" style="--start:5%;--len:12%">Fog Burst</div>
+          <div class="cue" style="--start:20%;--len:15%">Pixel Sweep</div>
+          <div class="cue" style="--start:40%;--len:18%">Relay Cluster</div>
+          <div class="cue" style="--start:65%;--len:25%">Finale Pulse</div>
+          <div class="playhead"></div>
+        </div>
+      </div>
+      <div class="studio-side">
+        <div class="wave-panel">
+          <div class="wave-label">MP3 Deck A</div>
+          <div class="waveform-bars" id="waveform-bars"></div>
+        </div>
+        <div class="control-stack">
+          <div class="control-card">
+            <span>Manual Override</span>
+            <strong id="mode-indicator">Manual</strong>
+          </div>
+          <div class="control-card">
+            <span>Next Cue</span>
+            <button class="btn mini" data-role="next">Advance</button>
+          </div>
+          <div class="control-card">
+            <span>Stop All</span>
+            <button class="btn mini danger" data-role="stop">Kill Switch</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section specs" id="specs">
+    <div class="section-header">
+      <p class="eyebrow">Tech Specs</p>
+      <h2>Performance tuned hardware + software</h2>
+    </div>
+    <div class="spec-grid">
+      <article>
+        <h3>ESP32-S3 Core</h3>
+        <ul>
+          <li>UI board: JC8048W550C + GT911 touch</li>
+          <li>Brain board: Showduino Core ESP32-S3</li>
+          <li>Dedicated LVGL render loop</li>
+        </ul>
+      </article>
+      <article>
+        <h3>Pixel Capacity</h3>
+        <ul>
+          <li>4 lines, 4096+ WS2812B at full brightness</li>
+          <li>Matrices & volumetric rigs supported</li>
+          <li>Per-line power domains + failsafe FX</li>
+        </ul>
+      </article>
+      <article>
+        <h3>SD + Storage</h3>
+        <ul>
+          <li>Structured /show/ projects on SD</li>
+          <li>Auto logs + diagnostics per run</li>
+          <li>Audio + cue templates in folders</li>
+        </ul>
+      </article>
+      <article>
+        <h3>Network Modes</h3>
+        <ul>
+          <li>Serial bridge (default)</li>
+          <li>Wi-Fi station + AP modes</li>
+          <li>Future: multi-brain sync / OSC</li>
+        </ul>
+      </article>
+      <article>
+        <h3>Software</h3>
+        <ul>
+          <li>Showduino Studio</li>
+          <li>Vixen Lights</li>
+          <li>xLights</li>
+        </ul>
+      </article>
+      <article>
+        <h3>Reliability</h3>
+        <ul>
+          <li>Heartbeat & emergency fallbacks</li>
+          <li>Prop auto-detection via I²C</li>
+          <li>Redundant relay watchdog</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section class="section downloads" id="downloads">
+    <div class="section-header">
+      <p class="eyebrow">Downloads</p>
+      <h2>Firmware, manuals & templates</h2>
+    </div>
+    <div class="download-grid">
+      <article>
+        <h3>Firmware ZIP</h3>
+        <p>Latest UI + Brain binaries with release notes.</p>
+        <a class="btn primary" href="#" aria-label="Download firmware">Download</a>
+      </article>
+      <article>
+        <h3>Operator Manual</h3>
+        <p>Full setup guide, wiring diagrams, best practices.</p>
+        <a class="btn ghost" href="#">View PDF</a>
+      </article>
+      <article>
+        <h3>Prop Diagrams</h3>
+        <p>Lantern, R3 Console, SX1509 breakouts, relay harnesses.</p>
+        <a class="btn ghost" href="#">Download Pack</a>
+      </article>
+      <article>
+        <h3>Show Templates</h3>
+        <p>Kickstart new productions with curated timeline files.</p>
+        <a class="btn ghost" href="#">Import Templates</a>
+      </article>
+    </div>
+  </section>
+
+  <section class="section hauntsync" id="hauntsync">
+    <div class="section-header">
+      <p class="eyebrow">HauntSync</p>
+      <h2>Login / Registration</h2>
+      <p>Cloud-linked control for large attractions. Sync multiple brains, share cues, manage subscriptions and Firebase auth.</p>
+    </div>
+    <div class="auth-panel">
+      <div class="auth-tabs" role="tablist">
+        <button role="tab" class="active" data-auth-panel="login">Login</button>
+        <button role="tab" data-auth-panel="register">Register</button>
+      </div>
+      <form class="auth-form active" data-panel="login">
+        <label>Email<br /><input type="email" placeholder="crew@show.com" required /></label>
+        <label>Password<br /><input type="password" placeholder="••••••••" required /></label>
+        <button class="btn primary" type="submit">Sign In</button>
+        <small>Firebase-backed auth, SSO ready.</small>
+      </form>
+      <form class="auth-form" data-panel="register">
+        <label>Team / Venue<br /><input type="text" placeholder="Echo Immersive" required /></label>
+        <label>Email<br /><input type="email" placeholder="ops@echoimmersive.com" required /></label>
+        <label>Password<br /><input type="password" placeholder="Create a passphrase" required /></label>
+        <button class="btn primary" type="submit">Create Account</button>
+        <small>Choose tiers for single haunt, multi-stage, or touring rigs.</small>
+      </form>
+    </div>
+  </section>
+
+  <footer class="site-footer" id="contact">
+    <div>
+      <h3>Showduino</h3>
+      <p>Built by Echo Immersive · Smart FX control for modern attractions.</p>
+    </div>
+    <div>
+      <p><strong>Contact</strong></p>
+      <p><a href="mailto:hello@showduino.com">hello@showduino.com</a></p>
+      <p><a href="#hauntsync">HauntSync Portal</a></p>
+    </div>
+    <div>
+      <p><strong>Follow</strong></p>
+      <p>Instagram · LinkedIn · Discord (invite)</p>
+      <p class="footnote">© <span id="year"></span> Showduino & Echo Immersive</p>
+    </div>
+  </footer>
+
+  <script src="/web/app.js" defer></script>
 </body>
 </html>
