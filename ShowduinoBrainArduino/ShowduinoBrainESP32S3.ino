@@ -24,10 +24,22 @@ static const char* WIFI_PASS = "";
 // If you have an SD slot wired to SD_MMC (4-bit), set this true.
 static const bool USE_SD_MMC = false;
 // SPI SD pins (only used when USE_SD_MMC=false)
-static const int SD_SPI_CS   = -1;
-static const int SD_SPI_SCK  = -1;
-static const int SD_SPI_MOSI = -1;
-static const int SD_SPI_MISO = -1;
+//
+// Recommended default wiring for a generic ESP32-S3 dev board (SPI microSD module):
+// - SD CS   -> GPIO10
+// - SD SCK  -> GPIO12
+// - SD MOSI -> GPIO11
+// - SD MISO -> GPIO13
+//
+// Notes:
+// - Avoid ESP32-S3 strapping pins GPIO0 / GPIO45 / GPIO46.
+// - Avoid USB pins GPIO19/20 if you rely on native USB.
+// - If your board uses these pins for other peripherals, you can move to any free GPIOs
+//   and update these constants + the wiring accordingly.
+static const int SD_SPI_CS   = 10;
+static const int SD_SPI_SCK  = 12;
+static const int SD_SPI_MOSI = 11;
+static const int SD_SPI_MISO = 13;
 
 // =====================================================================
 
