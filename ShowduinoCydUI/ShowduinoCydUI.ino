@@ -77,6 +77,7 @@ static const uint32_t POLL_PROPS_MS  = 800;
 static const uint32_t POLL_SHOWS_MS  = 2000;
 
 static const char* CACHE_DIR = "/cache";
+static const char* OUTBOX_DIR = "/outbox";
 
 // ---------------------- Theme ----------------------
 static const uint32_t CLR_GORE_BLACK = 0x111111;
@@ -97,6 +98,8 @@ static lv_obj_t* lblStatus = nullptr;
 static lv_obj_t* lblProps  = nullptr;
 static lv_obj_t* lblShows  = nullptr;
 static lv_obj_t* txtShowName = nullptr;
+static lv_obj_t* taShowJson = nullptr;
+static lv_obj_t* lblEditorMsg = nullptr;
 
 static bool sdOk = false;
 
@@ -116,6 +119,16 @@ static bool httpPostEmpty(const String& url, uint16_t timeoutMs = 600) {
   http.setTimeout(timeoutMs);
   if (!http.begin(url)) return false;
   int code = http.POST("");
+  http.end();
+  return code > 0 && code < 400;
+}
+
+static bool httpPostText(const String& url, const String& body, const char* contentType = "application/json", uint16_t timeoutMs = 1200) {
+  HTTPClient http;
+  http.setTimeout(timeoutMs);
+  if (!http.begin(url)) return false;
+  http.addHeader("Content-Type", contentType);
+  int code = http.POST((uint8_t*)body.c_str(), body.length());
   http.end();
   return code > 0 && code < 400;
 }
@@ -160,6 +173,13 @@ static String sdCacheRead(const char* name) {
   return sdReadText(p.c_str());
 }
 
+static String cacheShowFileName(const String& showName) {
+  String n = showName;
+  n.replace("/", "_");
+  n.replace("..", "_");
+  return String("show_") + n + ".json";
+}
+
 // ---------------------- LVGL flush/touch ----------------------
 static void lvgl_flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
   if (!gfx) { lv_disp_flush_ready(disp); return; }
@@ -200,23 +220,111 @@ static void onStop(lv_event_t* e) {
   (void)httpPostEmpty(url);
 }
 
+static void editorMsg(const String& s) {
+  if (!lblEditorMsg) return;
+  lv_label_set_text(lblEditorMsg, s.c_str());
+}
+
+static void onLoadShow(lv_event_t* e) {
+  (void)e;
+  if (!taShowJson || !txtShowName) return;
+  String name = String(lv_textarea_get_text(txtShowName));
+  name.trim();
+  if (!name.length()) { editorMsg("Enter show name"); return; }
+
+  editorMsg("Loading...");
+  yield();
+  String body = httpGetText(String(BRAIN_HOST) + "/api/show?name=" + name, 900);
+
+  if (!body.length()) {
+    // Fallback to SD cache
+    if (sdOk) {
+      String cached = sdCacheRead(cacheShowFileName(name).c_str());
+      if (cached.length()) {
+        lv_textarea_set_text(taShowJson, cached.c_str());
+        editorMsg("Loaded from SD cache");
+        return;
+      }
+    }
+    editorMsg("Load failed");
+    return;
+  }
+
+  lv_textarea_set_text(taShowJson, body.c_str());
+  if (sdOk) sdCacheWrite(cacheShowFileName(name).c_str(), body);
+  editorMsg("Loaded");
+}
+
+static void onSaveShow(lv_event_t* e) {
+  (void)e;
+  if (!taShowJson || !txtShowName) return;
+  String name = String(lv_textarea_get_text(txtShowName));
+  name.trim();
+  if (!name.length()) { editorMsg("Enter show name"); return; }
+
+  String body = String(lv_textarea_get_text(taShowJson));
+  body.trim();
+  if (!body.length()) { editorMsg("Show JSON empty"); return; }
+
+  editorMsg("Saving...");
+  yield();
+
+  bool ok = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    ok = httpPostText(String(BRAIN_HOST) + "/api/show?name=" + name, body, "application/json", 1400);
+  }
+
+  if (ok) {
+    if (sdOk) sdCacheWrite(cacheShowFileName(name).c_str(), body);
+    editorMsg("Saved to Brain");
+  } else {
+    // Save to SD outbox as safety
+    if (sdOk) {
+      sdEnsureDir(OUTBOX_DIR);
+      String path = String(OUTBOX_DIR) + "/" + cacheShowFileName(name);
+      sdWriteText(path.c_str(), body);
+      sdCacheWrite(cacheShowFileName(name).c_str(), body);
+      editorMsg("Save failed; saved to SD outbox");
+    } else {
+      editorMsg("Save failed");
+    }
+  }
+}
+
 static void buildUI() {
   lv_obj_t* scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_hex(CLR_GORE_BLACK), 0);
 
+  // Top bar
   lv_obj_t* top = lv_obj_create(scr);
   lv_obj_set_size(top, lv_pct(100), 64);
   lv_obj_align(top, LV_ALIGN_TOP_MID, 0, 0);
 
   txtShowName = lv_textarea_create(top);
-  lv_obj_set_size(txtShowName, 200, 44);
+  lv_obj_set_size(txtShowName, 220, 44);
   lv_obj_align(txtShowName, LV_ALIGN_LEFT_MID, 10, 0);
   lv_textarea_set_one_line(txtShowName, true);
   lv_textarea_set_text(txtShowName, "Haunt1");
 
+  lv_obj_t* btnLoad = lv_btn_create(top);
+  lv_obj_set_size(btnLoad, 110, 44);
+  lv_obj_align(btnLoad, LV_ALIGN_LEFT_MID, 240, 0);
+  lv_obj_add_event_cb(btnLoad, onLoadShow, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* lblL = lv_label_create(btnLoad);
+  lv_label_set_text(lblL, "LOAD");
+  lv_obj_center(lblL);
+
+  lv_obj_t* btnSave = lv_btn_create(top);
+  lv_obj_set_size(btnSave, 110, 44);
+  lv_obj_align(btnSave, LV_ALIGN_LEFT_MID, 360, 0);
+  lv_obj_add_event_cb(btnSave, onSaveShow, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* lblSv = lv_label_create(btnSave);
+  lv_label_set_text(lblSv, "SAVE");
+  lv_obj_center(lblSv);
+
   lv_obj_t* btnPlay = lv_btn_create(top);
   lv_obj_set_size(btnPlay, 110, 44);
-  lv_obj_align(btnPlay, LV_ALIGN_LEFT_MID, 225, 0);
+  lv_obj_align(btnPlay, LV_ALIGN_LEFT_MID, 480, 0);
   lv_obj_add_event_cb(btnPlay, onPlay, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* lblP = lv_label_create(btnPlay);
   lv_label_set_text(lblP, "PLAY");
@@ -224,15 +332,27 @@ static void buildUI() {
 
   lv_obj_t* btnStop = lv_btn_create(top);
   lv_obj_set_size(btnStop, 110, 44);
-  lv_obj_align(btnStop, LV_ALIGN_LEFT_MID, 345, 0);
+  lv_obj_align(btnStop, LV_ALIGN_LEFT_MID, 600, 0);
   lv_obj_add_event_cb(btnStop, onStop, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* lblS = lv_label_create(btnStop);
   lv_label_set_text(lblS, "STOP");
   lv_obj_center(lblS);
 
-  lv_obj_t* body = lv_obj_create(scr);
-  lv_obj_set_size(body, lv_pct(100), SCREEN_H - 74);
-  lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 74);
+  lblEditorMsg = lv_label_create(top);
+  lv_obj_align(lblEditorMsg, LV_ALIGN_RIGHT_MID, -10, 0);
+  lv_label_set_text(lblEditorMsg, "");
+
+  // Tabs
+  lv_obj_t* tabs = lv_tabview_create(scr, LV_DIR_TOP, 48);
+  lv_obj_set_size(tabs, SCREEN_W, SCREEN_H - 64);
+  lv_obj_align(tabs, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+  lv_obj_t* tabMonitor = lv_tabview_add_tab(tabs, "Monitor");
+  lv_obj_t* tabEditor  = lv_tabview_add_tab(tabs, "Editor");
+
+  // Monitor tab layout (3 panels)
+  lv_obj_t* body = lv_obj_create(tabMonitor);
+  lv_obj_set_size(body, lv_pct(100), lv_pct(100));
   lv_obj_set_flex_flow(body, LV_FLEX_FLOW_ROW);
 
   auto makePanel = [&](const char* title) -> lv_obj_t* {
@@ -261,6 +381,20 @@ static void buildUI() {
   lv_obj_align(lblShows, LV_ALIGN_TOP_LEFT, 8, 32);
   lv_label_set_long_mode(lblShows, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(lblShows, lv_pct(100));
+
+  // Editor tab: show JSON editor
+  lv_obj_t* ed = lv_obj_create(tabEditor);
+  lv_obj_set_size(ed, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_pad_all(ed, 8, 0);
+
+  taShowJson = lv_textarea_create(ed);
+  lv_obj_set_size(taShowJson, lv_pct(100), lv_pct(100));
+  lv_textarea_set_text(taShowJson,
+    "{\"name\":\"Haunt1\",\"events\":[\\n"
+    "  {\"t\":0,\"type\":\"prop\",\"targets\":[\"LanternA\"],\"payload\":{\"cmd\":\"mp3\",\"action\":\"play\",\"track\":3,\"volume\":20}},\\n"
+    "  {\"t\":0,\"type\":\"wled\",\"host\":\"192.168.1.50\",\"state\":{\"on\":true,\"ps\":1}},\\n"
+    "  {\"t\":5000,\"type\":\"prop\",\"targets\":[\"LanternA\"],\"payload\":{\"cmd\":\"mp3\",\"action\":\"stop\"}}\\n"
+    "]}");
 }
 
 // ---------------------- Init: display/touch/sd/wifi ----------------------
@@ -295,6 +429,7 @@ static void initSD() {
   sdOk = SD.begin(SD_CS_PIN);
   if (sdOk) {
     sdEnsureDir(CACHE_DIR);
+    sdEnsureDir(OUTBOX_DIR);
   }
 }
 
@@ -376,6 +511,13 @@ void setup() {
     s = sdCacheRead("status.json"); if (s.length()) uiSetLabel(lblStatus, s);
     s = sdCacheRead("props.json");  if (s.length()) uiSetLabel(lblProps, s);
     s = sdCacheRead("shows.json");  if (s.length()) uiSetLabel(lblShows, s);
+    // Load last cached show draft for default name
+    String name = String(lv_textarea_get_text(txtShowName));
+    name.trim();
+    if (name.length() && taShowJson) {
+      s = sdCacheRead(cacheShowFileName(name).c_str());
+      if (s.length()) lv_textarea_set_text(taShowJson, s.c_str());
+    }
   }
 
   initWiFi();
