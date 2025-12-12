@@ -51,12 +51,58 @@ static const int SD_SPI_MISO = 13;
 #include <SPI.h>
 #include <SD.h>
 #include <SD_MMC.h>
+#include <FastLED.h>
 
 #include <ArduinoJson.h>
 #include "showduino_protocol.h"
 
 // ----------------------------- Web server -----------------------------
 static WebServer server(80);
+
+// ----------------------------- Brain LEDs -----------------------------
+// Optional local LED strip controlled directly by the Brain via FastLED.
+// Set BRAIN_LED_COUNT to 0 to disable.
+static const int BRAIN_LED_PIN = 14;          // change to your wiring
+static const uint16_t BRAIN_LED_COUNT = 60;   // change to your strip length; 0 disables FastLED output
+static const EOrder BRAIN_LED_ORDER = GRB;
+static const uint8_t BRAIN_LED_BRIGHTNESS_DEFAULT = 128;
+
+#if (BRAIN_LED_COUNT > 0)
+static CRGB brainLeds[BRAIN_LED_COUNT];
+static bool brainLedOn = true;
+static uint8_t brainLedBri = BRAIN_LED_BRIGHTNESS_DEFAULT;
+static CRGB brainLedColor = CRGB::Red;
+
+static void brainLedApply() {
+  FastLED.setBrightness(brainLedOn ? brainLedBri : 0);
+  for (uint16_t i = 0; i < BRAIN_LED_COUNT; i++) brainLeds[i] = brainLedColor;
+  FastLED.show();
+}
+
+static void brainLedFromJson(JsonObject set) {
+  if (set.isNull()) return;
+  if (!set["on"].isNull()) brainLedOn = set["on"].as<bool>();
+  if (!set["bri"].isNull()) {
+    int b = set["bri"].as<int>();
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    brainLedBri = (uint8_t)b;
+  }
+  if (set["rgb"].is<JsonArray>()) {
+    JsonArray a = set["rgb"].as<JsonArray>();
+    if (a.size() >= 3) {
+      brainLedColor.r = (uint8_t)(a[0].as<int>() & 0xFF);
+      brainLedColor.g = (uint8_t)(a[1].as<int>() & 0xFF);
+      brainLedColor.b = (uint8_t)(a[2].as<int>() & 0xFF);
+    }
+  } else if (!set["r"].isNull() || !set["g"].isNull() || !set["b"].isNull()) {
+    brainLedColor.r = (uint8_t)(set["r"] | brainLedColor.r);
+    brainLedColor.g = (uint8_t)(set["g"] | brainLedColor.g);
+    brainLedColor.b = (uint8_t)(set["b"] | brainLedColor.b);
+  }
+  brainLedApply();
+}
+#endif
 
 // ------------------------------ SD helper -----------------------------
 static bool sdOk = false;
@@ -321,6 +367,14 @@ static void runShowTick() {
       const char* host = ev["host"] | "";
       JsonObject state = ev["state"];
       if (host && *host && !state.isNull()) (void)postWledJsonState(host, state);
+    } else if (strcmp(type, "brain_led") == 0) {
+      // Local Brain LEDs via FastLED
+      // Example:
+      // {"t":0,"type":"brain_led","set":{"on":true,"bri":128,"rgb":[255,0,0]}}
+      #if (BRAIN_LED_COUNT > 0)
+      JsonObject set = ev["set"];
+      if (!set.isNull()) brainLedFromJson(set);
+      #endif
     }
 
     nextEventIdx++;
@@ -579,6 +633,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <textarea id="showjson" style="width:100%;height:220px" class="mono">
 {"name":"Haunt1","events":[
   {"t":0,"type":"prop","targets":["LanternA"],"payload":{"cmd":"mp3","action":"play","track":3,"volume":20}},
+  {"t":0,"type":"brain_led","set":{"on":true,"bri":128,"rgb":[255,0,0]}},
   {"t":0,"type":"wled","host":"192.168.1.50","state":{"on":true,"ps":1}},
   {"t":5000,"type":"prop","targets":["LanternA"],"payload":{"cmd":"mp3","action":"stop"}}
 ]}
@@ -650,6 +705,17 @@ static void handleApiStatus() {
   doc["wifi_sta"] = (WiFi.status() == WL_CONNECTED);
   doc["ap_ip"] = WIFI_AP_ENABLE ? WiFi.softAPIP().toString() : "";
   doc["sta_ip"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+  #if (BRAIN_LED_COUNT > 0)
+  JsonObject bl = doc.createNestedObject("brain_led");
+  bl["pin"] = BRAIN_LED_PIN;
+  bl["count"] = BRAIN_LED_COUNT;
+  bl["on"] = brainLedOn;
+  bl["bri"] = brainLedBri;
+  JsonArray rgb = bl.createNestedArray("rgb");
+  rgb.add(brainLedColor.r);
+  rgb.add(brainLedColor.g);
+  rgb.add(brainLedColor.b);
+  #endif
   String out;
   serializeJson(doc, out);
   apiSendJson(out);
