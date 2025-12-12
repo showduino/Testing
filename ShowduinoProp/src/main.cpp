@@ -3,6 +3,13 @@
 #include <ArduinoJson.h>
 #include "showduino_protocol.h"
 
+// Arduino IDE compatibility: ensure WiFi headers are included
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#else
+  #include <WiFi.h>
+#endif
+
 // -------- Build-time config (override in platformio.ini build_flags) --------
 #ifndef SHOWDUINO_PAIR_CODE
   #define SHOWDUINO_PAIR_CODE 0
